@@ -396,14 +396,20 @@ impl<S: Sysfs, K: Kernel, P: Procs> HostDevices for LinuxDevices<S, K, P> {
                 .write(&format!("bus/pci/devices/{id}/driver_override"), "")?;
         }
         self.kernel.load_module(&self.host_driver, &[])?;
-        if let Some(gpu) = self.functions.iter().find(|device| device.function == 0) {
+        // A repeated return must not fail: a bind of a function the host
+        // driver already holds would answer EBUSY.
+        if let Some(gpu) = self.functions.iter().find(|device| device.function == 0)
+            && self.driver(gpu)?.as_deref() != Some(self.host_driver.as_str())
+        {
             self.sysfs.write(
                 &format!("bus/pci/drivers/{}/bind", self.host_driver),
                 &bdf(gpu),
             )?;
         }
         for function in self.functions.iter().filter(|device| device.function != 0) {
-            self.sysfs.write("bus/pci/drivers_probe", &bdf(function))?;
+            if self.driver(function)?.is_none() {
+                self.sysfs.write("bus/pci/drivers_probe", &bdf(function))?;
+            }
         }
         Ok(())
     }

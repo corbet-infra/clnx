@@ -500,6 +500,24 @@ fn the_return_unbinds_the_gpu_function_first_and_probes_the_others_back() {
 }
 
 #[test]
+fn a_card_already_back_on_the_host_driver_is_a_no_op_apart_from_the_overrides() {
+    let sysfs = RecordingSysfs::card();
+    let writes = sysfs.writes();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default());
+
+    driver.unbind_passthrough(&function(0)).unwrap();
+
+    let written = writes.borrow().clone();
+    assert_eq!(written.len(), 4, "{written:?}");
+    assert!(
+        written
+            .iter()
+            .all(|(path, value)| path.ends_with("/driver_override") && value.is_empty())
+    );
+}
+
+#[test]
 fn an_undeclared_device_in_a_live_group_refuses_the_bind() {
     let extra = bdf(&DeviceAddress {
         domain: 0,
