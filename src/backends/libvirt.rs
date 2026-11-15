@@ -169,21 +169,24 @@ impl Libvirt for RealLibvirt {
     }
 
     fn balloon_stats(&self, name: &str) -> Result<BalloonStats> {
-        let stats = self.domain(name)?.memory_stats(0).map_err(backend)?;
-        let mut target_kib = None;
+        let domain = self.domain(name)?;
+        // The target the host last set is the domain's current memory; the
+        // balloon figure libvirt reports only follows once a guest driver
+        // answers, so it is not the target.
+        let target_kib = domain.info().map_err(backend)?.memory;
+        let stats = domain.memory_stats(0).map_err(backend)?;
         let mut resident_kib = None;
         let mut unused_kib = None;
         for stat in stats {
             if stat.tag == virt::sys::VIR_DOMAIN_MEMORY_STAT_UNUSED {
                 unused_kib = Some(stat.val);
-            } else if stat.tag == virt::sys::VIR_DOMAIN_MEMORY_STAT_ACTUAL_BALLOON {
-                target_kib = Some(stat.val);
             } else if stat.tag == virt::sys::VIR_DOMAIN_MEMORY_STAT_RSS {
                 resident_kib = Some(stat.val);
             }
         }
         Ok(BalloonStats {
-            target_mib: target_kib.unwrap_or(0) / 1024,
+            target_mib: target_kib / 1024,
+            // What the host holds for the guest: the resident set.
             actual_mib: resident_kib.map(|kib| kib / 1024),
             // The guest reports free memory in KiB; the contract counts 4 KiB pages.
             free_pages: unused_kib.map(|kib| kib / 4),

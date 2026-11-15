@@ -23,8 +23,10 @@ use crate::error::{ClnxError, Result};
 pub struct RenderOptions {
     /// The QEMU machine type.
     pub machine: String,
-    /// The emulator binary path.
-    pub emulator: String,
+    /// The emulator binary, as an absolute path. `None` lets libvirt choose
+    /// the host's default emulator (a bare name is not resolved on hosts
+    /// whose libvirt has no conventional `PATH`).
+    pub emulator: Option<String>,
     /// The pflash code file, when the firmware needs an explicit loader.
     pub loader: Option<PathBuf>,
     /// The NVRAM template, when the firmware needs an explicit template.
@@ -51,7 +53,7 @@ impl Default for RenderOptions {
     fn default() -> Self {
         Self {
             machine: "pc-q35-11.1".to_owned(),
-            emulator: "qemu-system-x86_64".to_owned(),
+            emulator: None,
             loader: None,
             nvram_template: None,
             nvram: None,
@@ -130,10 +132,9 @@ pub fn render_domain(spec: &InstanceSpec, options: &RenderOptions) -> Result<Str
     xml.line(1, "<on_reboot>restart</on_reboot>");
     xml.line(1, "<on_crash>destroy</on_crash>");
     xml.line(1, "<devices>");
-    xml.line(
-        2,
-        &format!("<emulator>{}</emulator>", escape(&options.emulator)),
-    );
+    if let Some(emulator) = &options.emulator {
+        xml.line(2, &format!("<emulator>{}</emulator>", escape(emulator)));
+    }
     let slots = render_disks(&mut xml, spec, options, macos);
     render_hostdevs(&mut xml, spec, &slots);
     render_interfaces(&mut xml, spec);
@@ -394,9 +395,14 @@ fn render_cpu(xml: &mut Xml, spec: &InstanceSpec, options: &RenderOptions, macos
             xml.line(1, "</cpu>");
         }
         None => {
+            // A guest without passed-through devices stays savable (managed
+            // save needs a migratable CPU, which drops `invtsc`); a guest that
+            // pins a device can neither migrate nor save, so it keeps the
+            // full host CPU.
+            let migratable = if spec.devices.is_empty() { "on" } else { "off" };
             xml.line(
                 1,
-                "<cpu mode='host-passthrough' check='none' migratable='off'>",
+                &format!("<cpu mode='host-passthrough' check='none' migratable='{migratable}'>"),
             );
             render_topology(xml, vcpus(spec));
             xml.line(1, "</cpu>");

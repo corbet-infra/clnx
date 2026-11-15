@@ -66,6 +66,23 @@ Listed for `cdrv`/the system owners, not applied here:
    rendered from `InstanceSpec`, and creating/resetting them remains `cdsk`'s
    work.
 
+## Proven on a real libvirt without the GPU
+
+`examples/srv_proof.rs` drives `LinuxInstances` and `LinuxMemory` against a
+live libvirt with a synthetic domain on a throwaway 4Kn disk: define from the
+rendered XML, start, lifecycle events, balloon target and guest free pages,
+managed save and restore, ACPI clean stop (no `destroy` anywhere). Notes from
+that run:
+
+- Events are delivered from the moment `virsh event` has registered; a
+  consumer subscribes first and then reads `list()` to close the gap. Event
+  order is a hint (a first start showed `Resumed` before `Started`); `state()`
+  is the truth.
+- A guest with no passed-through device renders a migratable CPU so managed
+  save works; a device-holding guest keeps the full host CPU (it cannot save).
+- `RenderOptions::emulator` is `None` by default: libvirt picks the host's
+  emulator (a bare name is not resolvable on hosts without a conventional PATH).
+
 ## What only the real host can prove
 
 - That libvirt accepts the rendered XML (`virt-xml-validate`,
