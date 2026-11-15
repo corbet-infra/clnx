@@ -12,11 +12,13 @@
 //! retried.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use cdrv::traits::{HostDevices, Result as CdrvResult};
 use cdrv::{DeviceAddress, DeviceClass, DeviceFacts, DeviceFilter};
 
-use crate::backends::{Kernel, Sysfs};
+use crate::backends::{Kernel, LinuxProcs, Procs, Sysfs};
 use crate::error::{ClnxError, Result};
 
 /// The size of a device's first BAR, as sysfs reports it.
@@ -45,12 +47,17 @@ impl Bar0Size {
 
 /// The Linux device driver: live sysfs facts plus the passthrough bind.
 #[derive(Debug, Clone)]
-pub struct LinuxDevices<S: Sysfs, K: Kernel> {
+pub struct LinuxDevices<S: Sysfs, K: Kernel, P: Procs = LinuxProcs> {
     sysfs: S,
     kernel: K,
+    procs: P,
     functions: Vec<DeviceAddress>,
     host_driver: String,
+    holder_wait: Duration,
 }
+
+/// How long the hand-over waits for holders of the card to leave.
+pub const DEFAULT_HOLDER_WAIT: Duration = Duration::from_secs(60);
 
 impl<S: Sysfs, K: Kernel> LinuxDevices<S, K> {
     /// A driver for one declared card.
@@ -67,9 +74,33 @@ impl<S: Sysfs, K: Kernel> LinuxDevices<S, K> {
         Self {
             sysfs,
             kernel,
+            procs: LinuxProcs::system(),
             functions,
             host_driver: host_driver.into(),
+            holder_wait: DEFAULT_HOLDER_WAIT,
         }
+    }
+}
+
+impl<S: Sysfs, K: Kernel, P: Procs> LinuxDevices<S, K, P> {
+    /// Use another process table (a fake in tests).
+    #[must_use]
+    pub fn with_procs<Q: Procs>(self, procs: Q) -> LinuxDevices<S, K, Q> {
+        LinuxDevices {
+            sysfs: self.sysfs,
+            kernel: self.kernel,
+            procs,
+            functions: self.functions,
+            host_driver: self.host_driver,
+            holder_wait: self.holder_wait,
+        }
+    }
+
+    /// How long the hand-over waits for holders to leave (default 60 s).
+    #[must_use]
+    pub fn with_holder_wait(mut self, wait: Duration) -> Self {
+        self.holder_wait = wait;
+        self
     }
 
     /// The declared function set.
@@ -90,6 +121,59 @@ impl<S: Sysfs, K: Kernel> LinuxDevices<S, K> {
             .sysfs
             .file_len(&format!("bus/pci/devices/{id}/resource0"))?;
         Ok(Bar0Size { bytes })
+    }
+
+    /// The device nodes of the card: the DRM nodes of every declared
+    /// function, plus `/dev/kfd` for the amdgpu driver.
+    fn device_nodes(&self) -> Result<Vec<PathBuf>> {
+        let mut nodes = Vec::new();
+        for device in &self.functions {
+            let names = self
+                .sysfs
+                .list(&format!("bus/pci/devices/{}/drm", bdf(device)))?;
+            for name in names {
+                if name.starts_with("card") || name.starts_with("renderD") {
+                    nodes.push(PathBuf::from("/dev/dri").join(name));
+                }
+            }
+        }
+        if self.host_driver == "amdgpu" {
+            nodes.push(PathBuf::from("/dev/kfd"));
+        }
+        Ok(nodes)
+    }
+
+    /// Refuse the hand-over while a process holds the card or the host
+    /// driver is still in use. Waits once for the holders to leave; kills
+    /// nothing.
+    fn ensure_released(&self) -> Result<()> {
+        let nodes = self.device_nodes()?;
+        let mut holders = self.procs.holders(&nodes);
+        if !holders.is_empty() {
+            let pids: Vec<u32> = holders.iter().map(|holder| holder.pid).collect();
+            self.procs.wait_exit(&pids, self.holder_wait);
+            holders = self.procs.holders(&nodes);
+        }
+        if !holders.is_empty() {
+            let named: Vec<String> = holders
+                .iter()
+                .map(|holder| format!("{} {} {}", holder.pid, holder.comm, holder.node.display()))
+                .collect();
+            return Err(ClnxError::Refused(format!(
+                "the card is still held open: {}",
+                named.join(", ")
+            )));
+        }
+        let module = self.host_driver.replace('-', "_");
+        let count = self.sysfs.read(&format!("module/{module}/refcnt"))?;
+        if count.trim() != "0" {
+            return Err(ClnxError::Refused(format!(
+                "{} is still in use (module use count {})",
+                self.host_driver,
+                count.trim()
+            )));
+        }
+        Ok(())
     }
 
     fn ensure_declared(&self, device: &DeviceAddress) -> Result<()> {
@@ -217,7 +301,7 @@ impl<S: Sysfs, K: Kernel> LinuxDevices<S, K> {
     }
 }
 
-impl<S: Sysfs, K: Kernel> HostDevices for LinuxDevices<S, K> {
+impl<S: Sysfs, K: Kernel, P: Procs> HostDevices for LinuxDevices<S, K, P> {
     fn enumerate(&self, filter: DeviceFilter) -> CdrvResult<Vec<DeviceFacts>> {
         let mut facts = Vec::new();
         for name in self.sysfs.pci_devices()? {
@@ -269,6 +353,7 @@ impl<S: Sysfs, K: Kernel> HostDevices for LinuxDevices<S, K> {
             ))
             .into());
         }
+        self.ensure_released()?;
         self.kernel
             .load_module("vfio-pci", &[("disable_idle_d3", "1")])?;
         let parameter = self

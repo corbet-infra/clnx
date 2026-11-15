@@ -1,12 +1,13 @@
-//! The four seams between the driver logic and the host.
+//! The seams between the driver logic and the host.
 //!
 //! Each is a small trait with a real implementation beside it, so every
-//! driver module is testable with a fake (`Libvirt`, `Systemd`, `Kube`) or a
+//! driver module is testable with a fake (`Libvirt`, `Systemd`, `Kube`, `Procs`) or a
 //! fixture tree (`Sysfs`, plus the `Kernel` seam for `modprobe`).
 
 pub mod kernel;
 pub mod kube;
 pub mod libvirt;
+pub mod procs;
 pub mod sysfs;
 pub mod systemd;
 pub mod virsh_events;
@@ -14,6 +15,7 @@ pub mod virsh_events;
 pub use kernel::{Kernel, LinuxKernel};
 pub use kube::{Kube, KubeClient, Workload, WorkloadKind};
 pub use libvirt::{DomainEventSource, Libvirt, NoDomainEvents, RealLibvirt};
+pub use procs::{Holder, LinuxProcs, Procs};
 pub use sysfs::{LinuxSysfs, Sysfs};
 pub use systemd::{Systemd, ZbusSystemd};
 pub use virsh_events::VirshEvents;

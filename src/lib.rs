@@ -16,7 +16,7 @@
 //!   moves Sunshine to whichever kernel holds it.
 //!
 //! Every host boundary is a small trait in [`backends`] (`Libvirt`, `Sysfs`,
-//! `Kernel`, `Systemd`, `Kube`), so the logic is tested with fakes and fixture
+//! `Kernel`, `Systemd`, `Kube`, `Procs`), so the logic is tested with fakes and fixture
 //! trees. This crate must never decide admission, hold a claim, poll for
 //! state, or destroy a guest outside the contract's explicit destroy. The
 //! README lists what only a real host can prove and the contract changes this
@@ -36,8 +36,9 @@ pub mod memory;
 mod proc;
 
 pub use backends::{
-    DomainEventSource, Kernel, Kube, KubeClient, Libvirt, LinuxKernel, LinuxSysfs, NoDomainEvents,
-    RealLibvirt, Sysfs, Systemd, Workload, WorkloadKind, ZbusSystemd,
+    DomainEventSource, Holder, Kernel, Kube, KubeClient, Libvirt, LinuxKernel, LinuxProcs,
+    LinuxSysfs, NoDomainEvents, Procs, RealLibvirt, Sysfs, Systemd, Workload, WorkloadKind,
+    ZbusSystemd,
 };
 pub use devices::{Bar0Size, LinuxDevices, bdf, parse_bdf};
 pub use domain_xml::{RenderOptions, is_fixed, render_domain};

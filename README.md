@@ -11,12 +11,12 @@ facts.
 |---|---|---|
 | `instances` | `HostInstances` | Defines libvirt domains rendered from the one source (`InstanceSpec`), starts them, stops them cleanly (guest agent / ACPI, never `destroy`), and translates lifecycle events. |
 | `domain_xml` | — | The single renderer: desktop class (VFIO functions, the 64 GiB MMIO window for ReBAR, fixed memory, no balloon), dev class (balloon, free-page reporting), 4Kn on every disk, macOS balloon on `pcie.0`. Pure and snapshot-tested. |
-| `devices` | `HostDevices` | Enumerates PCI functions and their **live** IOMMU groups from sysfs, refuses passthrough if a group holds an undeclared device, binds functions `.1 .2 .3` then `.0` (audio/USB/i2c before the GPU), returns in the proven reverse order, resets once and reports the result, and reports BAR0 size. |
+| `devices` | `HostDevices` | Enumerates PCI functions and their **live** IOMMU groups from sysfs, refuses passthrough if a group holds an undeclared device, binds functions `.1 .2 .3` then `.0` (audio/USB/i2c before the GPU) only when no process holds the card's DRM nodes (or `/dev/kfd` for amdgpu) and the host driver's module use count is 0, returns in the proven reverse order, resets once and reports the result, and reports BAR0 size. |
 | `memory` | `HostMemory` | Reports `MemAvailable` plus the evictable ARC (`size - c_min` capped) and the PSI `full avg10` share; moves a balloon and reads balloon/RSS figures through libvirt. |
 | `gpu` | `HostGpu` | Stops the desktop session at its unit (the container keeps running), scales a GPU pod to zero behind Argo CD's skip-reconcile and restores its own replica count, and moves Sunshine to the kernel that holds the card. |
 
 Every host boundary is a small trait in `backends`: `Libvirt`, `Sysfs`,
-`Kernel`, `Systemd`, `Kube`. Tests use fakes and fixture trees (a synthetic
+`Kernel`, `Systemd`, `Kube`, `Procs`. Tests use fakes and fixture trees (a synthetic
 `/sys` directory, a fixture `/proc`, channel-fed events); nothing in the test
 suite needs a hypervisor, a cluster or a GPU.
 
@@ -27,6 +27,10 @@ suite needs a hypervisor, a cluster or a GPU.
   clean guest-agent/ACPI request,
 - poll for state: lifecycle changes arrive as events, and a missing event
   source is reported rather than replaced by a loop,
+- kill a process that holds the card: the hand-over waits (pidfd, event-driven,
+  default 60 s) for the holders to leave and then refuses, naming
+  `pid comm node`; it never writes to sysfs while a holder or a busy host
+  driver remains,
 - retry a failed reset or an unbind the kernel blocked: the failure is
   reported,
 - read a declaration instead of the live host for an IOMMU group or a driver,
@@ -61,7 +65,12 @@ Listed for `cdrv`/the system owners, not applied here:
 6. **Tenant replica counts** (resolved by cdrv `HostGpu::tenant_replicas` and
    `start_tenant(.., replicas)`): the driver keeps no state; the caller reads
    the count before the stop and passes it back. Zero replicas are refused.
-7. **Storage.** `HostStorage` is not implemented in this iteration; disks are
+7. **Holder gate.** `bind_passthrough` refuses while a process holds the
+   card or `/sys/module/<host_driver>/refcnt` is not 0. The runtime must
+   take the desktop session off the card (and wait for that job) before it
+   asks for the bind. The `Sysfs` trait gained `list`, and `LinuxDevices`
+   gained a `Procs` backend (`with_procs`, `with_holder_wait`).
+8. **Storage.** `HostStorage` is not implemented in this iteration; disks are
    rendered from `InstanceSpec`, and creating/resetting them remains `cdsk`'s
    work.
 

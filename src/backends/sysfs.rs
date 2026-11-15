@@ -27,6 +27,10 @@ pub trait Sysfs {
     /// The size in bytes of a binary attribute, such as a BAR file.
     fn file_len(&self, relative: &str) -> Result<u64>;
 
+    /// The entry names of a directory below the root, sorted; empty when the
+    /// directory is absent.
+    fn list(&self, relative: &str) -> Result<Vec<String>>;
+
     /// Whether a path below the root exists.
     fn exists(&self, relative: &str) -> bool;
 }
@@ -97,6 +101,24 @@ impl Sysfs for LinuxSysfs {
         let path = self.path(relative);
         let metadata = fs::metadata(&path).map_err(|error| ClnxError::io(&path, error))?;
         Ok(metadata.len())
+    }
+
+    fn list(&self, relative: &str) -> Result<Vec<String>> {
+        let directory = self.path(relative);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(ClnxError::io(&directory, error)),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| ClnxError::io(&directory, error))?;
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort_unstable();
+        Ok(names)
     }
 
     fn exists(&self, relative: &str) -> bool {

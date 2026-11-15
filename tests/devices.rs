@@ -6,10 +6,13 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use cdrv::traits::HostDevices;
 use cdrv::{DeviceAddress, DeviceClass, DeviceFilter};
-use clnx::{Bar0Size, Kernel, LinuxDevices, LinuxKernel, LinuxSysfs, Sysfs, bdf};
+use clnx::{
+    Bar0Size, Holder, Kernel, LinuxDevices, LinuxKernel, LinuxProcs, LinuxSysfs, Procs, Sysfs, bdf,
+};
 use tempfile::TempDir;
 
 fn function(number: u8) -> DeviceAddress {
@@ -33,6 +36,8 @@ struct RecordingSysfs {
     writes: Rc<RefCell<Vec<(String, String)>>>,
     classes: HashMap<String, &'static str>,
     fail_bind: Option<String>,
+    drm: HashMap<String, Vec<String>>,
+    refcnt: String,
 }
 
 impl RecordingSysfs {
@@ -59,6 +64,8 @@ impl RecordingSysfs {
             writes: Rc::new(RefCell::new(Vec::new())),
             classes,
             fail_bind: None,
+            drm: HashMap::new(),
+            refcnt: "0".to_owned(),
         }
     }
 
@@ -66,6 +73,15 @@ impl RecordingSysfs {
         self.devices.push(name.to_owned());
         self.groups.insert(name.to_owned(), Some(group));
         self.classes.insert(name.to_owned(), class);
+        self
+    }
+
+    /// The card exposes DRM nodes under its GPU function.
+    fn with_drm(mut self, names: &[&str]) -> Self {
+        self.drm.insert(
+            format!("bus/pci/devices/{}/drm", bdf(&function(0))),
+            names.iter().map(|name| (*name).to_owned()).collect(),
+        );
         self
     }
 
@@ -94,6 +110,9 @@ impl Sysfs for RecordingSysfs {
         }
         if relative.ends_with("/vendor") {
             return Ok("0x1002".to_owned());
+        }
+        if relative == "module/amdgpu/refcnt" {
+            return Ok(self.refcnt.clone());
         }
         Err(clnx::ClnxError::io(
             relative,
@@ -149,6 +168,10 @@ impl Sysfs for RecordingSysfs {
         ))
     }
 
+    fn list(&self, relative: &str) -> clnx::Result<Vec<String>> {
+        Ok(self.drm.get(relative).cloned().unwrap_or_default())
+    }
+
     fn exists(&self, relative: &str) -> bool {
         if relative.ends_with("/driver")
             && let Some(name) = device_of(relative)
@@ -197,12 +220,178 @@ impl Kernel for RecordingKernel {
     }
 }
 
+type Wait = (Vec<u32>, Duration);
+
+/// A process table that replays scripted scans and records the waits.
+#[derive(Default, Clone)]
+struct FakeProcs {
+    /// The answer of each successive scan; the last one repeats.
+    scans: Rc<RefCell<Vec<Vec<Holder>>>>,
+    scanned: Rc<RefCell<Vec<Vec<PathBuf>>>>,
+    waits: Rc<RefCell<Vec<Wait>>>,
+    /// Whether a wait makes the holders leave.
+    leave_on_wait: bool,
+}
+
+impl FakeProcs {
+    fn holding(holders: Vec<Holder>, leave_on_wait: bool) -> Self {
+        Self {
+            scans: Rc::new(RefCell::new(vec![holders])),
+            leave_on_wait,
+            ..Self::default()
+        }
+    }
+}
+
+impl Procs for FakeProcs {
+    fn holders(&self, nodes: &[PathBuf]) -> Vec<Holder> {
+        self.scanned.borrow_mut().push(nodes.to_vec());
+        let scans = self.scans.borrow();
+        scans.first().cloned().unwrap_or_default()
+    }
+
+    fn wait_exit(&self, pids: &[u32], timeout: Duration) {
+        self.waits.borrow_mut().push((pids.to_vec(), timeout));
+        if self.leave_on_wait {
+            self.scans.borrow_mut().clear();
+        }
+    }
+}
+
+fn holder(pid: u32, comm: &str, node: &str) -> Holder {
+    Holder {
+        pid,
+        comm: comm.to_owned(),
+        node: PathBuf::from(node),
+    }
+}
+
+#[test]
+fn a_free_card_binds_in_the_usual_order_and_scans_every_node() {
+    let sysfs = RecordingSysfs::card().with_drm(&["card1", "renderD128"]);
+    let writes = sysfs.writes();
+    let procs = FakeProcs::default();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(procs.clone());
+
+    driver.bind_passthrough(&function(0)).unwrap();
+
+    assert_eq!(
+        procs.scanned.borrow()[0],
+        vec![
+            PathBuf::from("/dev/dri/card1"),
+            PathBuf::from("/dev/dri/renderD128"),
+            PathBuf::from("/dev/kfd")
+        ]
+    );
+    assert!(procs.waits.borrow().is_empty(), "no holder, no wait");
+    assert!(
+        writes
+            .borrow()
+            .iter()
+            .any(|(path, _)| path == "bus/pci/drivers/vfio-pci/bind")
+    );
+}
+
+#[test]
+fn a_holder_that_exits_during_the_wait_lets_the_bind_go_ahead() {
+    let sysfs = RecordingSysfs::card().with_drm(&["card1"]);
+    let procs = FakeProcs::holding(vec![holder(42, "compositor", "/dev/dri/card1")], true);
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(procs.clone())
+        .with_holder_wait(Duration::from_secs(7));
+
+    driver.bind_passthrough(&function(0)).unwrap();
+
+    assert_eq!(
+        *procs.waits.borrow(),
+        vec![(vec![42], Duration::from_secs(7))]
+    );
+}
+
+#[test]
+fn a_holder_that_stays_refuses_the_bind_before_anything_is_written() {
+    let sysfs = RecordingSysfs::card().with_drm(&["card1"]);
+    let writes = sysfs.writes();
+    let kernel = RecordingKernel::new("Y");
+    let loads = Rc::clone(&kernel.calls);
+    let procs = FakeProcs::holding(vec![holder(42, "compositor", "/dev/dri/card1")], false);
+    let driver = LinuxDevices::new(sysfs, kernel, card(), "amdgpu").with_procs(procs.clone());
+
+    let error = driver.bind_passthrough(&function(0)).unwrap_err();
+
+    let text = error.to_string();
+    assert!(text.contains("42 compositor /dev/dri/card1"), "{text}");
+    assert_eq!(procs.waits.borrow().len(), 1);
+    assert!(writes.borrow().is_empty(), "nothing may reach sysfs");
+    assert!(loads.borrow().is_empty(), "no module load either");
+}
+
+#[test]
+fn a_busy_host_driver_refuses_the_bind_and_names_the_count() {
+    let mut sysfs = RecordingSysfs::card();
+    sysfs.refcnt = "3".to_owned();
+    let writes = sysfs.writes();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default());
+
+    let error = driver.bind_passthrough(&function(0)).unwrap_err();
+
+    let text = error.to_string();
+    assert!(text.contains("amdgpu") && text.contains('3'), "{text}");
+    assert!(writes.borrow().is_empty());
+}
+
+#[test]
+fn the_real_scan_finds_holders_by_fd_link_and_ignores_the_rest() {
+    let root = TempDir::new().unwrap();
+    let node = Path::new("/dev/dri/card1");
+    link(node, &root.path().join("100/fd/5"));
+    link(node, &root.path().join("100/fd/6"));
+    write(&root.path().join("100/comm"), "compositor\n");
+    link(Path::new("/dev/null"), &root.path().join("200/fd/0"));
+    fs::create_dir_all(root.path().join("300")).unwrap();
+    fs::create_dir_all(root.path().join("self")).unwrap();
+
+    let procs = LinuxProcs::new(root.path());
+    let found = procs.holders(&[node.to_path_buf(), PathBuf::from("/dev/kfd")]);
+
+    assert_eq!(found, vec![holder(100, "compositor", "/dev/dri/card1")]);
+    assert!(procs.holders(&[]).is_empty());
+}
+
+#[test]
+fn waiting_for_a_gone_pid_or_an_exiting_child_returns_promptly() {
+    let procs = LinuxProcs::system();
+    let mut child = std::process::Command::new("sleep")
+        .arg("0.2")
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    procs.wait_exit(&[child.id()], Duration::from_secs(20));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    child.wait().unwrap();
+    // The pid is reaped now: nothing to wait for.
+    procs.wait_exit(&[child.id()], Duration::from_secs(20));
+    // A process that stays is given up on at the deadline.
+    let mut stays = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    procs.wait_exit(&[stays.id()], Duration::from_millis(100));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    stays.kill().unwrap();
+    stays.wait().unwrap();
+}
+
 #[test]
 fn a_failed_bind_stops_without_retry_and_names_the_functions_already_bound() {
     let mut sysfs = RecordingSysfs::card();
     sysfs.fail_bind = Some(bdf(&function(2)));
     let writes = sysfs.writes();
-    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu");
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default());
 
     let error = driver
         .bind_passthrough(&function(0))
@@ -233,7 +422,8 @@ fn bind_takes_the_non_gpu_functions_first_and_the_gpu_function_last() {
     let writes = sysfs.writes();
     let kernel = RecordingKernel::new("Y");
     let loads = Rc::clone(&kernel.calls);
-    let driver = LinuxDevices::new(sysfs, kernel, card(), "amdgpu");
+    let driver =
+        LinuxDevices::new(sysfs, kernel, card(), "amdgpu").with_procs(FakeProcs::default());
 
     driver.bind_passthrough(&function(0)).unwrap();
 
@@ -272,7 +462,8 @@ fn the_return_unbinds_the_gpu_function_first_and_probes_the_others_back() {
     let sysfs = RecordingSysfs::card();
     let writes = sysfs.writes();
     let kernel = RecordingKernel::new("Y");
-    let driver = LinuxDevices::new(sysfs, kernel, card(), "amdgpu");
+    let driver =
+        LinuxDevices::new(sysfs, kernel, card(), "amdgpu").with_procs(FakeProcs::default());
 
     driver.bind_passthrough(&function(0)).unwrap();
     writes.borrow_mut().clear();
@@ -318,7 +509,8 @@ fn an_undeclared_device_in_a_live_group_refuses_the_bind() {
     });
     let sysfs = RecordingSysfs::card().with_extra(&extra, 16, "0x020000");
     let writes = sysfs.writes();
-    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu");
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default());
 
     let error = driver.bind_passthrough(&function(0)).unwrap_err();
     let text = error.to_string();
@@ -336,7 +528,8 @@ fn a_declared_function_without_an_iommu_group_is_refused() {
     let missing = bdf(&function(2));
     let mut sysfs = sysfs;
     sysfs.groups.insert(missing, None);
-    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu");
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default());
 
     let error = driver.bind_passthrough(&function(0)).unwrap_err();
     assert!(error.to_string().contains("no live IOMMU group"));
@@ -345,7 +538,8 @@ fn a_declared_function_without_an_iommu_group_is_refused() {
 #[test]
 fn a_device_outside_the_declared_set_is_refused() {
     let sysfs = RecordingSysfs::card();
-    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu");
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default());
 
     let error = driver
         .bind_passthrough(&DeviceAddress {
@@ -366,7 +560,8 @@ fn a_device_outside_the_declared_set_is_refused() {
 fn vfio_loaded_without_disable_idle_d3_refuses_the_bind() {
     let sysfs = RecordingSysfs::card();
     let writes = sysfs.writes();
-    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("N"), card(), "amdgpu");
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("N"), card(), "amdgpu")
+        .with_procs(FakeProcs::default());
 
     let error = driver.bind_passthrough(&function(0)).unwrap_err();
     assert!(error.to_string().contains("disable_idle_d3"));
