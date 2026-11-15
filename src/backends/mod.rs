@@ -17,7 +17,7 @@ pub use command::{CommandRunner, ProcessRunner};
 pub use kernel::{Kernel, LinuxKernel};
 pub use kube::{Kube, KubeClient, Workload, WorkloadKind};
 pub use libvirt::{DomainEventSource, Libvirt, NoDomainEvents, RealLibvirt};
-pub use procs::{Holder, LinuxProcs, Procs};
+pub use procs::{DeviceNode, Holder, LinuxProcs, Procs, makedev};
 pub use sysfs::{LinuxSysfs, Sysfs};
 pub use systemd::{Systemd, ZbusSystemd};
 pub use virsh_events::VirshEvents;

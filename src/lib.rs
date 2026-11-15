@@ -36,9 +36,9 @@ pub mod memory;
 mod proc;
 
 pub use backends::{
-    CommandRunner, DomainEventSource, Holder, Kernel, Kube, KubeClient, Libvirt, LinuxKernel,
-    LinuxProcs, LinuxSysfs, NoDomainEvents, ProcessRunner, Procs, RealLibvirt, Sysfs, Systemd,
-    Workload, WorkloadKind, ZbusSystemd,
+    CommandRunner, DeviceNode, DomainEventSource, Holder, Kernel, Kube, KubeClient, Libvirt,
+    LinuxKernel, LinuxProcs, LinuxSysfs, NoDomainEvents, ProcessRunner, Procs, RealLibvirt, Sysfs,
+    Systemd, Workload, WorkloadKind, ZbusSystemd, makedev,
 };
 pub use devices::{Bar0Size, LinuxDevices, bdf, parse_bdf};
 pub use domain_xml::{RenderOptions, is_fixed, render_domain};

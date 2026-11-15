@@ -1,15 +1,38 @@
 //! The process seam: who holds a device node open, and waiting for them.
 //!
 //! The card can only be handed to vfio-pci when no process holds its DRM
-//! nodes. The scan reads `/proc/<pid>/fd` links; the wait is event-driven
-//! through pidfds, never a poll loop with sleeps. Nothing here kills a process.
+//! nodes. The scan matches the DEVICE NUMBER of every open fd under
+//! `/proc/<pid>/fd`, not the link text: a process in a container sees the
+//! same node under its own name (the host's `card2` can be a container's
+//! `card0`). The wait is event-driven through pidfds, never a poll loop with
+//! sleeps. Nothing here kills a process.
 
 use std::fs;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+/// A character device node to look for, by device number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceNode {
+    /// The host's name for the node, used in messages.
+    pub node: PathBuf,
+    /// Its device number (`st_rdev`).
+    pub rdev: u64,
+}
+
+/// The device number Linux encodes for `major:minor` (glibc's `makedev`).
+#[must_use]
+pub const fn makedev(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (major as u64, minor as u64);
+    ((major & 0xffff_f000) << 32)
+        | ((major & 0x0000_0fff) << 8)
+        | ((minor & 0xffff_ff00) << 12)
+        | (minor & 0x0000_00ff)
+}
 
 /// A process that holds one of the scanned nodes open.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,8 +47,9 @@ pub struct Holder {
 
 /// The process operations the device driver needs.
 pub trait Procs {
-    /// Every process with an open fd whose link target is one of `nodes`.
-    fn holders(&self, nodes: &[PathBuf]) -> Vec<Holder>;
+    /// Every process with an open fd on one of `nodes` (matched by device
+    /// number).
+    fn holders(&self, nodes: &[DeviceNode]) -> Vec<Holder>;
 
     /// Wait until all of `pids` have exited, or `timeout` has passed.
     fn wait_exit(&self, pids: &[u32], timeout: Duration);
@@ -58,7 +82,7 @@ impl LinuxProcs {
 }
 
 impl Procs for LinuxProcs {
-    fn holders(&self, nodes: &[PathBuf]) -> Vec<Holder> {
+    fn holders(&self, nodes: &[DeviceNode]) -> Vec<Holder> {
         let mut found = Vec::new();
         if nodes.is_empty() {
             return found;
@@ -78,12 +102,18 @@ impl Procs for LinuxProcs {
             let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
                 continue;
             };
-            let mut seen: Vec<&PathBuf> = Vec::new();
+            let mut seen: Vec<&DeviceNode> = Vec::new();
             for fd in fds.flatten() {
-                let Ok(target) = fs::read_link(fd.path()) else {
+                // `metadata` follows the fd's magic link to the open inode, so
+                // the device number is the one the process really holds.
+                let Ok(metadata) = fs::metadata(fd.path()) else {
                     continue;
                 };
-                if let Some(node) = nodes.iter().find(|node| **node == target)
+                if !metadata.file_type().is_char_device() {
+                    continue;
+                }
+                let rdev = metadata.rdev();
+                if let Some(node) = nodes.iter().find(|node| node.rdev == rdev)
                     && !seen.contains(&node)
                 {
                     seen.push(node);
@@ -93,7 +123,7 @@ impl Procs for LinuxProcs {
                     found.push(Holder {
                         pid,
                         comm,
-                        node: node.clone(),
+                        node: node.node.clone(),
                     });
                 }
             }

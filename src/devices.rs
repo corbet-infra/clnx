@@ -18,7 +18,7 @@ use std::time::Duration;
 use cdrv::traits::{HostDevices, Result as CdrvResult};
 use cdrv::{DeviceAddress, DeviceClass, DeviceFacts, DeviceFilter};
 
-use crate::backends::{Kernel, LinuxProcs, Procs, Sysfs};
+use crate::backends::{DeviceNode, Kernel, LinuxProcs, Procs, Sysfs, makedev};
 use crate::error::{ClnxError, Result};
 
 /// The size of a device's first BAR, as sysfs reports it.
@@ -123,22 +123,29 @@ impl<S: Sysfs, K: Kernel, P: Procs> LinuxDevices<S, K, P> {
         Ok(Bar0Size { bytes })
     }
 
-    /// The device nodes of the card: the DRM nodes of every declared
-    /// function, plus `/dev/kfd` for the amdgpu driver.
-    fn device_nodes(&self) -> Result<Vec<PathBuf>> {
+    /// The device nodes of the card, by device number: the DRM nodes of every
+    /// declared function (`drm/<name>/dev`), plus `/dev/kfd` for the amdgpu
+    /// driver when the kernel exposes it.
+    fn device_nodes(&self) -> Result<Vec<DeviceNode>> {
         let mut nodes = Vec::new();
         for device in &self.functions {
-            let names = self
-                .sysfs
-                .list(&format!("bus/pci/devices/{}/drm", bdf(device)))?;
-            for name in names {
+            let drm = format!("bus/pci/devices/{}/drm", bdf(device));
+            for name in self.sysfs.list(&drm)? {
                 if name.starts_with("card") || name.starts_with("renderD") {
-                    nodes.push(PathBuf::from("/dev/dri").join(name));
+                    let number = self.sysfs.read(&format!("{drm}/{name}/dev"))?;
+                    nodes.push(DeviceNode {
+                        node: PathBuf::from("/dev/dri").join(&name),
+                        rdev: parse_dev(&number)?,
+                    });
                 }
             }
         }
-        if self.host_driver == "amdgpu" {
-            nodes.push(PathBuf::from("/dev/kfd"));
+        if self.host_driver == "amdgpu" && self.sysfs.exists("class/kfd/kfd/dev") {
+            let number = self.sysfs.read("class/kfd/kfd/dev")?;
+            nodes.push(DeviceNode {
+                node: PathBuf::from("/dev/kfd"),
+                rdev: parse_dev(&number)?,
+            });
         }
         Ok(nodes)
     }
@@ -421,6 +428,15 @@ impl<S: Sysfs, K: Kernel, P: Procs> HostDevices for LinuxDevices<S, K, P> {
             .write(&format!("bus/pci/devices/{id}/reset"), "1")?;
         Ok(())
     }
+}
+
+/// Parse a sysfs `dev` attribute (`226:2`) into a device number.
+fn parse_dev(text: &str) -> Result<u64> {
+    let invalid = || ClnxError::Refused(format!("unreadable device number {:?}", text.trim()));
+    let (major, minor) = text.trim().split_once(':').ok_or_else(invalid)?;
+    let major = major.parse::<u32>().map_err(|_| invalid())?;
+    let minor = minor.parse::<u32>().map_err(|_| invalid())?;
+    Ok(makedev(major, minor))
 }
 
 /// A PCI address as sysfs names it: `dddd:bb:ss.f`.

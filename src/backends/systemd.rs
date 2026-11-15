@@ -187,10 +187,11 @@ async fn unit_call(
     timeout: Duration,
 ) -> Result<()> {
     // Subscribe to the signal first: the job can finish before the reply to
-    // the call is read, and a signal sent earlier would be lost.
+    // the call is read, and a signal sent earlier would be lost. No sender in
+    // the rule: signals carry the manager's unique name, not the well-known
+    // one, and only the manager emits `JobRemoved` on this path.
     let rule = MatchRule::builder()
         .msg_type(Type::Signal)
-        .sender(DESTINATION)
         .interface(MANAGER)
         .member("JobRemoved")
         .path(PATH)

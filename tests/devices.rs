@@ -11,7 +11,8 @@ use std::time::Duration;
 use cdrv::traits::HostDevices;
 use cdrv::{DeviceAddress, DeviceClass, DeviceFilter};
 use clnx::{
-    Bar0Size, Holder, Kernel, LinuxDevices, LinuxKernel, LinuxProcs, LinuxSysfs, Procs, Sysfs, bdf,
+    Bar0Size, DeviceNode, Holder, Kernel, LinuxDevices, LinuxKernel, LinuxProcs, LinuxSysfs, Procs,
+    Sysfs, bdf, makedev,
 };
 use tempfile::TempDir;
 
@@ -114,6 +115,20 @@ impl Sysfs for RecordingSysfs {
         if relative == "module/amdgpu/refcnt" {
             return Ok(self.refcnt.clone());
         }
+        if relative == "class/kfd/kfd/dev" {
+            return Ok("235:0\n".to_owned());
+        }
+        if let Some(name) = relative
+            .strip_suffix("/dev")
+            .and_then(|rest| rest.rsplit('/').next())
+        {
+            if let Some(minor) = name.strip_prefix("renderD") {
+                return Ok(format!("226:{minor}\n"));
+            }
+            if let Some(minor) = name.strip_prefix("card") {
+                return Ok(format!("226:{minor}\n"));
+            }
+        }
         Err(clnx::ClnxError::io(
             relative,
             std::io::ErrorKind::NotFound.into(),
@@ -173,6 +188,9 @@ impl Sysfs for RecordingSysfs {
     }
 
     fn exists(&self, relative: &str) -> bool {
+        if relative == "class/kfd/kfd/dev" {
+            return true;
+        }
         if relative.ends_with("/driver")
             && let Some(name) = device_of(relative)
         {
@@ -227,7 +245,7 @@ type Wait = (Vec<u32>, Duration);
 struct FakeProcs {
     /// The answer of each successive scan; the last one repeats.
     scans: Rc<RefCell<Vec<Vec<Holder>>>>,
-    scanned: Rc<RefCell<Vec<Vec<PathBuf>>>>,
+    scanned: Rc<RefCell<Vec<Vec<DeviceNode>>>>,
     waits: Rc<RefCell<Vec<Wait>>>,
     /// Whether a wait makes the holders leave.
     leave_on_wait: bool,
@@ -244,7 +262,7 @@ impl FakeProcs {
 }
 
 impl Procs for FakeProcs {
-    fn holders(&self, nodes: &[PathBuf]) -> Vec<Holder> {
+    fn holders(&self, nodes: &[DeviceNode]) -> Vec<Holder> {
         self.scanned.borrow_mut().push(nodes.to_vec());
         let scans = self.scans.borrow();
         scans.first().cloned().unwrap_or_default()
@@ -279,9 +297,18 @@ fn a_free_card_binds_in_the_usual_order_and_scans_every_node() {
     assert_eq!(
         procs.scanned.borrow()[0],
         vec![
-            PathBuf::from("/dev/dri/card1"),
-            PathBuf::from("/dev/dri/renderD128"),
-            PathBuf::from("/dev/kfd")
+            DeviceNode {
+                node: PathBuf::from("/dev/dri/card1"),
+                rdev: makedev(226, 1)
+            },
+            DeviceNode {
+                node: PathBuf::from("/dev/dri/renderD128"),
+                rdev: makedev(226, 128)
+            },
+            DeviceNode {
+                node: PathBuf::from("/dev/kfd"),
+                rdev: makedev(235, 0)
+            },
         ]
     );
     assert!(procs.waits.borrow().is_empty(), "no holder, no wait");
@@ -343,21 +370,38 @@ fn a_busy_host_driver_refuses_the_bind_and_names_the_count() {
 }
 
 #[test]
-fn the_real_scan_finds_holders_by_fd_link_and_ignores_the_rest() {
+fn the_real_scan_matches_the_device_number_not_the_link_name() {
+    // A process in a container names the node differently: the scan must
+    // match what the fd really holds. `/dev/null` (1:3) stands in for a DRM
+    // node, linked under another name as a container would show it.
     let root = TempDir::new().unwrap();
-    let node = Path::new("/dev/dri/card1");
-    link(node, &root.path().join("100/fd/5"));
-    link(node, &root.path().join("100/fd/6"));
+    link(Path::new("/dev/null"), &root.path().join("100/fd/5"));
+    link(Path::new("/dev/null"), &root.path().join("100/fd/6"));
     write(&root.path().join("100/comm"), "compositor\n");
-    link(Path::new("/dev/null"), &root.path().join("200/fd/0"));
-    fs::create_dir_all(root.path().join("300")).unwrap();
+    link(Path::new("/dev/zero"), &root.path().join("200/fd/0"));
+    let plain = root.path().join("plain");
+    write(&plain, "not a device");
+    link(&plain, &root.path().join("300/fd/1"));
+    fs::create_dir_all(root.path().join("400")).unwrap();
     fs::create_dir_all(root.path().join("self")).unwrap();
 
     let procs = LinuxProcs::new(root.path());
-    let found = procs.holders(&[node.to_path_buf(), PathBuf::from("/dev/kfd")]);
+    let card = DeviceNode {
+        node: PathBuf::from("/dev/dri/card2"),
+        rdev: makedev(1, 3),
+    };
+    let found = procs.holders(&[card]);
 
-    assert_eq!(found, vec![holder(100, "compositor", "/dev/dri/card1")]);
+    assert_eq!(found, vec![holder(100, "compositor", "/dev/dri/card2")]);
     assert!(procs.holders(&[]).is_empty());
+}
+
+#[test]
+fn makedev_matches_the_kernel_encoding() {
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(fs::metadata("/dev/null").unwrap().rdev(), makedev(1, 3));
+    assert_eq!(makedev(226, 128), (226 << 8) | 128);
+    assert_eq!(makedev(4096, 256), (1 << 44) | (1 << 20));
 }
 
 #[test]
