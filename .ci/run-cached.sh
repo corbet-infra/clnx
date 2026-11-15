@@ -51,6 +51,8 @@ proto --version
 moon --version
 rustc -vV
 cargo --version
-"$CCID_BIN" cached --repo "$PWD" --check "$CHECKS"
+# clnx links the libvirt client library: enter the pinned Nix shell only for the cached check execution.
+# Re-prepend the verified ccid directory inside the shell so `ccid` on PATH stays exact.
+nix-shell .ci/check-shell.nix --run 'export PATH="$(dirname "$CCID_BIN"):$PATH"; exec "$CCID_BIN" cached --repo "$PWD" --check "$CHECKS"'
 IFS=, read -r -a selected_checks <<< "$CHECKS"
 for check in "${selected_checks[@]}"; do test -s ".ccid/results/$check.jsonl"; done

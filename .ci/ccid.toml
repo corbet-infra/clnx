@@ -5,7 +5,8 @@ project = "clnx"
 [checks.rust]
 kind = "cargo"
 actions = ["fmt", "test", "clippy"]
-cache_tools = [["rustc", "-vV"], ["cargo", "--version"]]
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["pkg-config", "--version"]]
+cache_env = ["LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "NIX_CFLAGS_COMPILE", "NIX_LDFLAGS", "CC", "CXX"]
 
 [render]
 render_schema = 2
