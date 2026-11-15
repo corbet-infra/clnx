@@ -173,6 +173,19 @@ impl<S: Sysfs, K: Kernel> LinuxDevices<S, K> {
         Ok(intruders)
     }
 
+    fn bind_one(&self, function: &DeviceAddress, id: &str) -> Result<()> {
+        self.sysfs
+            .write(&format!("bus/pci/devices/{id}/driver_override"), "vfio-pci")?;
+        if self.driver(function)?.as_deref() == Some("vfio-pci") {
+            return Ok(());
+        }
+        if self.driver(function)?.is_some() {
+            self.sysfs
+                .write(&format!("bus/pci/devices/{id}/driver/unbind"), id)?;
+        }
+        self.sysfs.write("bus/pci/drivers/vfio-pci/bind", id)
+    }
+
     /// The bind order: every non-zero function ascending, function 0 last.
     fn bind_order(&self) -> Vec<DeviceAddress> {
         let mut order = self.functions.clone();
@@ -261,18 +274,20 @@ impl<S: Sysfs, K: Kernel> HostDevices for LinuxDevices<S, K> {
             ))
             .into());
         }
+        let mut done: Vec<String> = Vec::new();
         for function in self.bind_order() {
             let id = bdf(&function);
-            self.sysfs
-                .write(&format!("bus/pci/devices/{id}/driver_override"), "vfio-pci")?;
-            if self.driver(&function)?.as_deref() == Some("vfio-pci") {
-                continue;
-            }
-            if self.driver(&function)?.is_some() {
-                self.sysfs
-                    .write(&format!("bus/pci/devices/{id}/driver/unbind"), &id)?;
-            }
-            self.sysfs.write("bus/pci/drivers/vfio-pci/bind", &id)?;
+            // A failure stops the bind (never retried) and names the functions
+            // already on vfio-pci, so the caller sees the half-bound card.
+            self.bind_one(&function, &id)
+                .map_err(|error| ClnxError::Backend {
+                    backend: "vfio bind",
+                    message: format!(
+                        "binding {id} failed ({error}); already on vfio-pci: [{}]",
+                        done.join(", ")
+                    ),
+                })?;
+            done.push(id);
         }
         Ok(())
     }

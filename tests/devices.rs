@@ -32,6 +32,7 @@ struct RecordingSysfs {
     drivers: RefCell<HashMap<String, String>>,
     writes: Rc<RefCell<Vec<(String, String)>>>,
     classes: HashMap<String, &'static str>,
+    fail_bind: Option<String>,
 }
 
 impl RecordingSysfs {
@@ -57,6 +58,7 @@ impl RecordingSysfs {
             drivers: RefCell::new(drivers),
             writes: Rc::new(RefCell::new(Vec::new())),
             classes,
+            fail_bind: None,
         }
     }
 
@@ -104,6 +106,12 @@ impl Sysfs for RecordingSysfs {
             .borrow_mut()
             .push((relative.to_owned(), value.to_owned()));
         if relative == "bus/pci/drivers/vfio-pci/bind" {
+            if self.fail_bind.as_deref() == Some(value) {
+                return Err(clnx::ClnxError::io(
+                    relative,
+                    std::io::ErrorKind::PermissionDenied.into(),
+                ));
+            }
             self.drivers
                 .borrow_mut()
                 .insert(value.to_owned(), "vfio-pci".to_owned());
@@ -187,6 +195,36 @@ impl Kernel for RecordingKernel {
             .push(format!("parameter {module}.{parameter}"));
         Ok(self.parameter.clone())
     }
+}
+
+#[test]
+fn a_failed_bind_stops_without_retry_and_names_the_functions_already_bound() {
+    let mut sysfs = RecordingSysfs::card();
+    sysfs.fail_bind = Some(bdf(&function(2)));
+    let writes = sysfs.writes();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu");
+
+    let error = driver
+        .bind_passthrough(&function(0))
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains(&bdf(&function(2))), "{error}");
+    assert!(
+        error.contains(&bdf(&function(1))),
+        "names the bound one: {error}"
+    );
+    let binds: Vec<String> = writes
+        .borrow()
+        .iter()
+        .filter(|(path, _)| path == "bus/pci/drivers/vfio-pci/bind")
+        .map(|(_, value)| value.clone())
+        .collect();
+    assert_eq!(
+        binds,
+        vec![bdf(&function(1)), bdf(&function(2))],
+        "no retry, no later function"
+    );
 }
 
 #[test]
