@@ -116,7 +116,7 @@ fn a_pod_tenant_is_scaled_to_zero_behind_argo_and_restored_to_its_own_count() {
     );
     kube.borrow_mut().clear();
 
-    gpu.start_tenant(tenant, GpuLadder::BestEffort).unwrap();
+    gpu.start_tenant(tenant, GpuLadder::BestEffort, 2).unwrap();
     assert_eq!(
         kube.borrow().clone(),
         vec![
@@ -135,7 +135,7 @@ fn the_desktop_tenant_is_its_session_unit_not_a_pod() {
         systemd.borrow().clone(),
         vec!["stop:desktop-session.service".to_owned()]
     );
-    gpu.start_tenant("desktop", GpuLadder::Desktop).unwrap();
+    gpu.start_tenant("desktop", GpuLadder::Desktop, 1).unwrap();
     assert_eq!(
         systemd.borrow().clone(),
         vec![
@@ -202,5 +202,42 @@ fn a_name_in_two_namespaces_must_be_qualified() {
         .stop_tenant("inference", GpuLadder::Interactive)
         .unwrap_err();
     assert!(error.to_string().contains("namespace/name"));
+    assert!(kube.borrow().is_empty());
+}
+
+#[test]
+fn tenant_replicas_reads_the_cluster() {
+    let (gpu, _systemd, _kube) = default_driver(vec![workload("llm", "inference", 3)]);
+    assert_eq!(
+        gpu.tenant_replicas("llm/inference", GpuLadder::Interactive)
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        gpu.tenant_replicas("desktop", GpuLadder::Desktop).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn a_fresh_driver_restores_the_given_count_after_a_crash() {
+    // The workload sits at zero and this driver never saw the stop.
+    let (gpu, _systemd, kube) = default_driver(vec![workload("llm", "inference", 0)]);
+    gpu.start_tenant("llm/inference", GpuLadder::BestEffort, 3)
+        .unwrap();
+    assert!(
+        kube.borrow().iter().any(|c| c.contains('3')),
+        "{:?}",
+        kube.borrow()
+    );
+}
+
+#[test]
+fn starting_with_zero_replicas_is_refused() {
+    let (gpu, _systemd, kube) = default_driver(vec![workload("llm", "inference", 0)]);
+    assert!(
+        gpu.start_tenant("llm/inference", GpuLadder::BestEffort, 0)
+            .is_err()
+    );
     assert!(kube.borrow().is_empty());
 }

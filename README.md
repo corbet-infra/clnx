@@ -58,10 +58,9 @@ Listed for `cdrv`/the system owners, not applied here:
    belong in `cdrv` beside `MemoryFacts`. They currently exist in `cdct` and,
    so that a driver does not depend on the conductor, in this crate's private
    `proc` module.
-6. **Tenant replica counts.** `HostGpu` has no way to report or recover the
-   replica count it scaled away; `clnx` remembers it in memory, and a fresh
-   process restores a tenant to one replica. A persisted tenant ledger (or a
-   `HostGpu::tenant_replicas`) would make the restore exact after a crash.
+6. **Tenant replica counts** (resolved by cdrv `HostGpu::tenant_replicas` and
+   `start_tenant(.., replicas)`): the driver keeps no state; the caller reads
+   the count before the stop and passes it back. Zero replicas are refused.
 7. **Storage.** `HostStorage` is not implemented in this iteration; disks are
    rendered from `InstanceSpec`, and creating/resetting them remains `cdsk`'s
    work.
