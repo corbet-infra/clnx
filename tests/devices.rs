@@ -382,6 +382,11 @@ fn the_real_scan_matches_the_device_number_not_the_link_name() {
     let plain = root.path().join("plain");
     write(&plain, "not a device");
     link(&plain, &root.path().join("300/fd/1"));
+    // A target outside /dev is never even stat'ed (a stuck mount would block).
+    link(
+        Path::new("/nonexistent/stuck-mount/file"),
+        &root.path().join("300/fd/2"),
+    );
     fs::create_dir_all(root.path().join("400")).unwrap();
     fs::create_dir_all(root.path().join("self")).unwrap();
 

@@ -210,6 +210,26 @@ async fn unit_call(
     unit: &str,
     timeout: Duration,
 ) -> Result<()> {
+    // The whole exchange runs under the deadline, the method calls too: a
+    // manager that never answers must not block the caller forever.
+    match tokio::time::timeout(timeout, unit_exchange(connection, method, unit, timeout)).await {
+        Ok(result) => result,
+        Err(_) => Err(ClnxError::backend(
+            "systemd",
+            format!(
+                "{method} {unit} did not finish within {} s (result: timeout)",
+                timeout.as_secs()
+            ),
+        )),
+    }
+}
+
+async fn unit_exchange(
+    connection: &Connection,
+    method: &str,
+    unit: &str,
+    timeout: Duration,
+) -> Result<()> {
     // Subscribe to the signal first: the job can finish before the reply to
     // the call is read, and a signal sent earlier would be lost. No sender in
     // the rule: signals carry the manager's unique name, not the well-known

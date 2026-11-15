@@ -104,6 +104,16 @@ impl Procs for LinuxProcs {
             };
             let mut seen: Vec<&DeviceNode> = Vec::new();
             for fd in fds.flatten() {
+                // Only device nodes are of interest, and they live under /dev
+                // in every view (host, container, pod). Reading the link first
+                // keeps the stat below away from files on other mounts: a stat
+                // of a file on a stuck network or FUSE mount would block.
+                let Ok(target) = fs::read_link(fd.path()) else {
+                    continue;
+                };
+                if !target.starts_with("/dev/") {
+                    continue;
+                }
                 // `metadata` follows the fd's magic link to the open inode, so
                 // the device number is the one the process really holds.
                 let Ok(metadata) = fs::metadata(fd.path()) else {
