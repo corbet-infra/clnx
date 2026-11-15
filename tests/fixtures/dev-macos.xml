@@ -1,7 +1,7 @@
 <domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
   <name>dev-mac</name>
   <memory unit='MiB'>8192</memory>
-  <currentMemory unit='MiB'>4096</currentMemory>
+  <currentMemory unit='MiB'>8192</currentMemory>
   <vcpu placement='static'>4</vcpu>
   <sysinfo type='smbios'>
     <system>

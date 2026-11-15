@@ -243,3 +243,10 @@ fn zero_vcpus_are_refused() {
     spec.vcpus = Some(0);
     assert!(render_domain(&spec, &options_macos()).is_err());
 }
+
+#[test]
+fn a_balloon_guest_boots_at_its_max_not_its_floor() {
+    let xml = render_domain(&dev_macos(), &options_macos()).unwrap();
+    assert!(xml.contains("<memory unit='MiB'>8192</memory>"));
+    assert!(xml.contains("<currentMemory unit='MiB'>8192</currentMemory>"));
+}

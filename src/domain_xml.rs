@@ -102,7 +102,7 @@ pub fn render_domain(spec: &InstanceSpec, options: &RenderOptions) -> Result<Str
         1,
         &format!(
             "<currentMemory unit='MiB'>{}</currentMemory>",
-            spec.memory.min_mib
+            spec.memory.max_mib
         ),
     );
     if let Some(extra) = options
