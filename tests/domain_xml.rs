@@ -139,13 +139,12 @@ fn dev_macos_puts_the_balloon_on_pcie_zero_and_has_no_rebar_window() {
     );
     assert!(!xml.contains("X-PciMmio64Mb"));
     assert!(!xml.contains("<hostdev"));
-    assert_eq!(
-        xml.matches("<blockio logical_block_size='4096' physical_block_size='4096'/>")
-            .count(),
-        1
-    );
     assert!(xml.contains("<disk type='file' device='cdrom'>"));
-    assert!(xml.contains("<target dev='sdb' bus='sata' rotation_rate='1'/>"));
+    // macOS disks are emulated NVMe at 4096/4096 behind the OpenCore CD (bootindex 1), never SATA
+    assert!(!xml.contains("<blockio"));
+    assert!(!xml.contains("rotation_rate"));
+    assert!(xml.contains("nvme,drive=nvm0,serial=SYNTHETIC-DISK-2,logical_block_size=4096,physical_block_size=4096,discard_granularity=16384,bus=pcie.0,addr=0x14,bootindex=2"));
+    assert!(xml.contains("file=/dev/zvol/pool/vms/dev-mac,format=raw,cache=none,aio=native,discard=unmap,detect-zeroes=unmap"));
     assert!(xml.contains("isa-applesmc,osk=test-osk"));
     assert!(xml.contains("<graphics") || xml.contains("<video>"));
 }

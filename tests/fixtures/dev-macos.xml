@@ -43,14 +43,6 @@
       <readonly/>
       <boot order='1'/>
     </disk>
-    <disk type='block' device='disk'>
-      <driver name='qemu' type='raw' cache='none' discard='unmap'/>
-      <source dev='/dev/zvol/pool/vms/dev-mac'/>
-      <target dev='sdb' bus='sata' rotation_rate='1'/>
-      <blockio logical_block_size='4096' physical_block_size='4096'/>
-      <serial>SYNTHETIC-DISK-2</serial>
-      <boot order='2'/>
-    </disk>
     <controller type='sata' index='0'/>
     <input type='keyboard' bus='ps2'/>
     <input type='mouse' bus='ps2'/>
@@ -68,5 +60,9 @@
     <qemu:arg value='isa-applesmc,osk=test-osk'/>
     <qemu:arg value='-cpu'/>
     <qemu:arg value='Skylake-Client-v4,vendor=GenuineIntel,+invtsc,kvm=on'/>
+    <qemu:arg value='-drive'/>
+    <qemu:arg value='if=none,id=nvm0,file=/dev/zvol/pool/vms/dev-mac,format=raw,cache=none,aio=native,discard=unmap,detect-zeroes=unmap'/>
+    <qemu:arg value='-device'/>
+    <qemu:arg value='nvme,drive=nvm0,serial=SYNTHETIC-DISK-2,logical_block_size=4096,physical_block_size=4096,discard_granularity=16384,bus=pcie.0,addr=0x14,bootindex=2'/>
   </qemu:commandline>
 </domain>

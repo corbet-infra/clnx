@@ -456,11 +456,18 @@ fn render_disks(
         index = 1;
     }
     for disk in &spec.disks {
+        if macos {
+            // macOS disks are emulated NVMe, 4096/4096 (render_commandline): QEMU
+            // refuses 4096-byte sectors on SATA/IDE. Boot order follows the CD.
+            order += 1;
+            index += 1;
+            continue;
+        }
         render_disk(xml, disk, sata, order, index);
         order += 1;
         index += 1;
     }
-    if sata && !spec.disks.is_empty() {
+    if sata && options.opencore_iso.is_some() {
         xml.line(2, "<controller type='sata' index='0'/>");
     }
     // One guest slot per distinct host slot, in address order; the functions
@@ -682,6 +689,26 @@ fn render_commandline(xml: &mut Xml, spec: &InstanceSpec, options: &RenderOption
         if let Some(model) = &options.cpu_model {
             args.push("-cpu".to_owned());
             args.push(model.clone());
+        }
+    }
+    if macos {
+        // First guest bootindex after the OpenCore CD (1); pcie.0 slots 0x14.. (0x12 is the
+        // NIC, 0x13 the balloon, measured). discard + detect-zeroes let APFS TRIM free the zvol.
+        let first_boot = if options.opencore_iso.is_some() { 2 } else { 1 };
+        for (n, disk) in spec.disks.iter().enumerate() {
+            args.push("-drive".to_owned());
+            args.push(format!(
+                "if=none,id=nvm{n},file={},format=raw,cache=none,aio=native,discard=unmap,detect-zeroes=unmap{}",
+                disk.path.display(),
+                if disk.read_only { ",readonly=on" } else { "" }
+            ));
+            args.push("-device".to_owned());
+            args.push(format!(
+                "nvme,drive=nvm{n},serial={},logical_block_size=4096,physical_block_size=4096,discard_granularity=16384,bus=pcie.0,addr=0x{:x},bootindex={}",
+                disk.serial.clone().unwrap_or_else(|| format!("MACNVME{n}")),
+                0x14 + n,
+                first_boot + n
+            ));
         }
     }
     let large_bar =
