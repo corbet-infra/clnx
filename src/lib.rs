@@ -40,7 +40,7 @@ pub use backends::{
     RealLibvirt, Sysfs, Systemd, Workload, WorkloadKind, ZbusSystemd,
 };
 pub use devices::{Bar0Size, LinuxDevices, bdf, parse_bdf};
-pub use domain_xml::{Nic, RenderOptions, Smbios, is_fixed, render_domain};
+pub use domain_xml::{RenderOptions, is_fixed, render_domain};
 pub use error::{ClnxError, Result};
 pub use events::{DomainEvent, DomainEventKind, StartDetail, StopDetail, now_timestamp, translate};
 pub use gpu::{LinuxGpu, TenantConfig};

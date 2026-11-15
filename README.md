@@ -41,23 +41,19 @@ through libvirt, D-Bus, Kubernetes, or a sysfs write.
 
 Listed for `cdrv`/the system owners, not applied here:
 
-1. **Lifecycle events.** The adopted `virt` 0.5.0 crate exposes the libvirt
-   event loop but not `virConnectDomainEventRegisterAny`. `DomainEventSource`
-   is the seam and the translation is complete and tested, but the production
-   source needs that binding (in `virt`, or a small `virt-sys` bridge) — a
-   driver must not fall back to polling.
-2. **A paused state.** `cdrv::InstanceState` has no paused/suspended value.
-   A suspend is emitted as an `instance.suspended` warning carrying
-   `"state": "suspended"`, and libvirt's paused/PM-suspended states read as
-   `Running` (they are live). Add `Paused`.
-3. **Device facts.** `HostDevices` cannot report a BAR size. `clnx` exposes
-   `LinuxDevices::bar0_size` inherently; `DeviceFacts.bar0_bytes` or a trait
-   method would make the ReBAR fact part of the contract.
-4. **Instance options.** `InstanceSpec` carries neither the NIC, the console,
-   the machine/firmware paths, the vCPU count, the SMBIOS identity, nor the
-   declared function set of the card. `RenderOptions` and the `LinuxDevices`
-   constructor carry them today; they deserve contract fields or an options
-   payload.
+1. **Lifecycle events** (resolved here, not in the contract). `virt` 0.5.0 has
+   no `virConnectDomainEventRegisterAny` and this crate forbids `unsafe`, so
+   `RealLibvirt` streams events from `virsh event --loop`, libvirt's own event
+   client (it blocks on the event stream; nothing polls). A native
+   registration can replace it behind `DomainEventSource`.
+2. **Paused state, BAR0 fact, spec vcpus/nic/console/identity**: delivered by
+   the `cdrv` batch 2 contract and used here (`InstanceState::Paused`,
+   `DeviceFacts::bar0_bytes`, the spec fields). Still local: machine type,
+   firmware paths, OpenCore image, the declared function set of the card.
+3. **Guest identity**: the spec carries SMBIOS identity; the AppleSMC OSK is
+   never in the spec and arrives only through `RenderOptions`.
+4. **Console**: `spec.console` renders a VNC socket (libvirt picks the path
+   unless `RenderOptions::console_socket` names one).
 5. **Memory parsers.** The pure `/proc/meminfo`, `arcstats` and PSI parsers
    belong in `cdrv` beside `MemoryFacts`. They currently exist in `cdct` and,
    so that a driver does not depend on the conductor, in this crate's private
@@ -81,7 +77,8 @@ Listed for `cdrv`/the system owners, not applied here:
 - The systemd unit names and the user-bus address of the desktop session.
 - Kubernetes RBAC for the dynamic client, Argo CD's annotation actually
   holding a manual scale, and the cluster's real GPU resource names.
-- `StopMode::Hibernate` (libvirt managed save).
+- `StopMode::Hibernate` with a VFIO guest (managed save of a GPU-less guest is
+  proven on the srv; see `examples/srv_proof.rs`).
 
 ## How to run the tests
 

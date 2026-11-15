@@ -112,6 +112,10 @@ fn spec() -> InstanceSpec {
         class: InstanceClass::Dev,
         devices: Vec::new(),
         disks: Vec::new(),
+        vcpus: None,
+        nic: None,
+        console: false,
+        identity: None,
     }
 }
 
@@ -232,9 +236,9 @@ fn suspend_is_a_warning_because_the_contract_has_no_paused_state() {
         kind: DomainEventKind::Suspended,
     };
     let translated = translate(&event, &mut log);
-    assert_eq!(translated.kind, "instance.suspended");
+    assert_eq!(translated.kind, "instance.paused");
     assert_eq!(translated.severity, Severity::Warn);
-    assert_eq!(translated.data["state"], "suspended");
+    assert_eq!(translated.data["state"], "paused");
 }
 
 #[test]

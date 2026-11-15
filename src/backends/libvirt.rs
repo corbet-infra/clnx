@@ -2,10 +2,10 @@
 //!
 //! The driver never polls: a [`DomainEventSource`] pushes lifecycle events and
 //! [`Libvirt::events`] hands its receiver to the caller. The `virt` 0.5.0 crate
-//! exposes the libvirt event loop but not
-//! `virConnectDomainEventRegisterAny`, so the production source is injected
-//! and the default [`NoDomainEvents`] reports that gap instead of inventing a
-//! poll. Tests inject a source fed by a channel.
+//! has no `virConnectDomainEventRegisterAny`, so [`RealLibvirt`] defaults to
+//! [`VirshEvents`](super::VirshEvents) (libvirt's own event client, blocking on
+//! the event stream). [`NoDomainEvents`] remains for callers that want an
+//! explicit refusal; tests inject a source fed by a channel.
 
 use std::sync::mpsc::Receiver;
 
@@ -102,7 +102,7 @@ impl RealLibvirt {
         let connection = Connect::open(Some(uri)).map_err(backend)?;
         Ok(Self {
             connection,
-            events: Box::new(NoDomainEvents),
+            events: Box::new(super::VirshEvents::new(uri)),
         })
     }
 
@@ -172,8 +172,11 @@ impl Libvirt for RealLibvirt {
         let stats = self.domain(name)?.memory_stats(0).map_err(backend)?;
         let mut target_kib = None;
         let mut resident_kib = None;
+        let mut unused_kib = None;
         for stat in stats {
-            if stat.tag == virt::sys::VIR_DOMAIN_MEMORY_STAT_ACTUAL_BALLOON {
+            if stat.tag == virt::sys::VIR_DOMAIN_MEMORY_STAT_UNUSED {
+                unused_kib = Some(stat.val);
+            } else if stat.tag == virt::sys::VIR_DOMAIN_MEMORY_STAT_ACTUAL_BALLOON {
                 target_kib = Some(stat.val);
             } else if stat.tag == virt::sys::VIR_DOMAIN_MEMORY_STAT_RSS {
                 resident_kib = Some(stat.val);
@@ -182,7 +185,8 @@ impl Libvirt for RealLibvirt {
         Ok(BalloonStats {
             target_mib: target_kib.unwrap_or(0) / 1024,
             actual_mib: resident_kib.map(|kib| kib / 1024),
-            free_pages: None,
+            // The guest reports free memory in KiB; the contract counts 4 KiB pages.
+            free_pages: unused_kib.map(|kib| kib / 4),
         })
     }
 
@@ -197,14 +201,13 @@ fn backend(error: virt::error::Error) -> ClnxError {
 
 /// Map libvirt's state onto the contract's state set.
 ///
-/// The contract has no paused state; a paused or PM-suspended domain is live,
-/// so it reads as [`InstanceState::Running`]. The README lists the gap.
+/// A paused or PM-suspended domain is [`InstanceState::Paused`].
 fn domain_state(domain: &Domain) -> Result<InstanceState> {
     let (state, _reason) = domain.state().map_err(backend)?;
     Ok(match state {
         Enum::Known(DomainState::NoState | DomainState::Shutoff) => InstanceState::Stopped,
         Enum::Known(DomainState::Running | DomainState::Blocked) => InstanceState::Running,
-        Enum::Known(DomainState::Paused | DomainState::PMSuspended) => InstanceState::Running,
+        Enum::Known(DomainState::Paused | DomainState::PMSuspended) => InstanceState::Paused,
         Enum::Known(DomainState::Shutdown) => InstanceState::Stopping,
         Enum::Known(DomainState::Crashed) => InstanceState::Failed("domain crashed".to_owned()),
         Enum::Unknown(raw) => InstanceState::Failed(format!("unknown libvirt state {raw}")),

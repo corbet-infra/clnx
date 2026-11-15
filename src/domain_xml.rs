@@ -18,37 +18,6 @@ use std::path::PathBuf;
 
 use crate::error::{ClnxError, Result};
 
-/// The guest NIC the spec does not carry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Nic {
-    /// The MAC address the guest sees.
-    pub mac: String,
-    /// The virtio model libvirt asks QEMU for.
-    pub model: String,
-}
-
-/// Identifiers a Windows guest is frozen to.
-///
-/// These are a deployment fact (Windows activation depends on them), so they
-/// are supplied by the private instance definition and never defaulted here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Smbios {
-    /// The system manufacturer string.
-    pub manufacturer: String,
-    /// The system product string.
-    pub product: String,
-    /// The system version string.
-    pub version: String,
-    /// The optional system UUID.
-    pub system_uuid: Option<String>,
-    /// The optional board manufacturer.
-    pub board_manufacturer: Option<String>,
-    /// The optional board product.
-    pub board_product: Option<String>,
-    /// The optional board version.
-    pub board_version: Option<String>,
-}
-
 /// Deployment data the instance spec does not carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderOptions {
@@ -68,20 +37,14 @@ pub struct RenderOptions {
     pub apple_smc_osk: Option<String>,
     /// A custom CPU model string, rendered through the QEMU command line.
     pub cpu_model: Option<String>,
-    /// The virtual CPU count (host policy, not an admission criterion).
-    pub vcpus: u32,
     /// The 64-bit MMIO window in MiB, so OVMF can place a large BAR.
     pub mmio64_mib: u64,
-    /// The guest NIC, when it has one.
-    pub nic: Option<Nic>,
-    /// A VNC socket for the local console.
+    /// The VNC socket rendered when the spec asks for a console.
     pub console_socket: Option<PathBuf>,
     /// Whether to keep an emulated display beside a passed-through card.
     pub emulated_display: bool,
     /// Extra MiB above the RAM claim for the domain's hard limit.
     pub hard_limit_extra_mib: Option<u64>,
-    /// The SMBIOS identity of a Windows guest.
-    pub smbios: Option<Smbios>,
 }
 
 impl Default for RenderOptions {
@@ -95,15 +58,19 @@ impl Default for RenderOptions {
             opencore_iso: None,
             apple_smc_osk: None,
             cpu_model: None,
-            vcpus: 8,
             mmio64_mib: 65_536,
-            nic: None,
             console_socket: None,
             emulated_display: true,
             hard_limit_extra_mib: Some(4096),
-            smbios: None,
         }
     }
+}
+
+/// The vCPU count when the spec does not name one.
+const DEFAULT_VCPUS: u32 = 8;
+
+fn vcpus(spec: &InstanceSpec) -> u32 {
+    spec.vcpus.unwrap_or(DEFAULT_VCPUS)
 }
 
 /// Render the libvirt domain XML for one instance.
@@ -115,7 +82,7 @@ impl Default for RenderOptions {
 /// whose fixed range is not fixed, or a passthrough set that cannot be placed
 /// on a guest PCI slot.
 pub fn render_domain(spec: &InstanceSpec, options: &RenderOptions) -> Result<String> {
-    validate(spec, options)?;
+    validate(spec)?;
     let macos = spec.guest_os == GuestOs::MacOs;
     let windows = spec.guest_os == GuestOs::Windows;
     let mut xml = Xml::default();
@@ -152,12 +119,12 @@ pub fn render_domain(spec: &InstanceSpec, options: &RenderOptions) -> Result<Str
     }
     xml.line(
         1,
-        &format!("<vcpu placement='static'>{}</vcpu>", options.vcpus),
+        &format!("<vcpu placement='static'>{}</vcpu>", vcpus(spec)),
     );
-    render_sysinfo(&mut xml, options, macos);
-    render_os(&mut xml, options, macos);
+    render_sysinfo(&mut xml, spec, macos);
+    render_os(&mut xml, spec, options, macos);
     render_features(&mut xml, windows);
-    render_cpu(&mut xml, options, macos);
+    render_cpu(&mut xml, spec, options, macos);
     render_clock(&mut xml, windows);
     xml.line(1, "<on_poweroff>destroy</on_poweroff>");
     xml.line(1, "<on_reboot>restart</on_reboot>");
@@ -169,8 +136,8 @@ pub fn render_domain(spec: &InstanceSpec, options: &RenderOptions) -> Result<Str
     );
     let slots = render_disks(&mut xml, spec, options, macos);
     render_hostdevs(&mut xml, spec, &slots);
-    render_interfaces(&mut xml, options);
-    render_console(&mut xml, options);
+    render_interfaces(&mut xml, spec);
+    render_console(&mut xml, spec, options);
     render_inputs(&mut xml, macos, windows);
     render_video(&mut xml, options, macos);
     render_balloon(&mut xml, spec, macos);
@@ -187,7 +154,7 @@ pub fn render_domain(spec: &InstanceSpec, options: &RenderOptions) -> Result<Str
 }
 
 /// Validate the spec against the platform rules before rendering anything.
-fn validate(spec: &InstanceSpec, options: &RenderOptions) -> Result<()> {
+fn validate(spec: &InstanceSpec) -> Result<()> {
     if spec.kind != InstanceKind::Vm {
         return Err(ClnxError::Unsupported(
             "clnx defines VMs as libvirt domains; containers and jails are other drivers"
@@ -203,7 +170,7 @@ fn validate(spec: &InstanceSpec, options: &RenderOptions) -> Result<()> {
                 .to_owned(),
         ));
     }
-    if options.vcpus == 0 {
+    if spec.vcpus == Some(0) {
         return Err(ClnxError::InvalidSpec(
             "vcpus must be at least 1".to_owned(),
         ));
@@ -275,7 +242,7 @@ fn validate_slots(devices: &[DeviceAddress]) -> Result<()> {
     Ok(())
 }
 
-fn render_sysinfo(xml: &mut Xml, options: &RenderOptions, macos: bool) {
+fn render_sysinfo(xml: &mut Xml, spec: &InstanceSpec, macos: bool) {
     if macos {
         xml.line(1, "<sysinfo type='smbios'>");
         xml.line(2, "<system>");
@@ -289,7 +256,7 @@ fn render_sysinfo(xml: &mut Xml, options: &RenderOptions, macos: bool) {
         xml.line(3, "<entry name='version'>1.0</entry>");
         xml.line(2, "</baseBoard>");
         xml.line(1, "</sysinfo>");
-    } else if let Some(smbios) = &options.smbios {
+    } else if let Some(smbios) = &spec.identity {
         xml.line(1, "<sysinfo type='smbios'>");
         xml.line(2, "<system>");
         xml.line(
@@ -338,8 +305,8 @@ fn render_sysinfo(xml: &mut Xml, options: &RenderOptions, macos: bool) {
     }
 }
 
-fn render_os(xml: &mut Xml, options: &RenderOptions, macos: bool) {
-    let sysinfo = macos || options.smbios.is_some();
+fn render_os(xml: &mut Xml, spec: &InstanceSpec, options: &RenderOptions, macos: bool) {
+    let sysinfo = macos || spec.identity.is_some();
     xml.line(1, "<os firmware='efi'>");
     xml.line(
         2,
@@ -410,7 +377,7 @@ fn render_features(xml: &mut Xml, windows: bool) {
     xml.line(1, "</features>");
 }
 
-fn render_cpu(xml: &mut Xml, options: &RenderOptions, macos: bool) {
+fn render_cpu(xml: &mut Xml, spec: &InstanceSpec, options: &RenderOptions, macos: bool) {
     if macos && options.cpu_model.is_some() {
         // The model travels through the QEMU command line, as the proven
         // macOS domain does; a `<cpu>` element beside it would duplicate -cpu.
@@ -423,7 +390,7 @@ fn render_cpu(xml: &mut Xml, options: &RenderOptions, macos: bool) {
                 2,
                 &format!("<model fallback='forbid'>{}</model>", escape(model)),
             );
-            render_topology(xml, options.vcpus);
+            render_topology(xml, vcpus(spec));
             xml.line(1, "</cpu>");
         }
         None => {
@@ -431,7 +398,7 @@ fn render_cpu(xml: &mut Xml, options: &RenderOptions, macos: bool) {
                 1,
                 "<cpu mode='host-passthrough' check='none' migratable='off'>",
             );
-            render_topology(xml, options.vcpus);
+            render_topology(xml, vcpus(spec));
             xml.line(1, "</cpu>");
         }
     }
@@ -595,24 +562,39 @@ fn render_hostdevs(xml: &mut Xml, spec: &InstanceSpec, slots: &BTreeMap<(u16, u8
     }
 }
 
-fn render_interfaces(xml: &mut Xml, options: &RenderOptions) {
-    if let Some(nic) = &options.nic {
+fn render_interfaces(xml: &mut Xml, spec: &InstanceSpec) {
+    if let Some(nic) = &spec.nic {
         xml.line(2, "<interface type='user'>");
         xml.line(3, &format!("<mac address='{}'/>", escape(&nic.mac)));
-        xml.line(3, &format!("<model type='{}'/>", escape(&nic.model)));
+        xml.line(
+            3,
+            &format!(
+                "<model type='{}'/>",
+                escape(nic.model.as_deref().unwrap_or("virtio"))
+            ),
+        );
         xml.line(2, "</interface>");
     }
 }
 
-fn render_console(xml: &mut Xml, options: &RenderOptions) {
-    if let Some(socket) = &options.console_socket {
-        xml.line(
+fn render_console(xml: &mut Xml, spec: &InstanceSpec, options: &RenderOptions) {
+    if !spec.console {
+        return;
+    }
+    match &options.console_socket {
+        Some(socket) => xml.line(
             2,
             &format!(
                 "<graphics type='vnc' socket='{}'/>",
                 escape(&socket.display().to_string())
             ),
-        );
+        ),
+        None => {
+            // libvirt picks the socket path itself.
+            xml.line(2, "<graphics type='vnc'>");
+            xml.line(3, "<listen type='socket'/>");
+            xml.line(2, "</graphics>");
+        }
     }
 }
 

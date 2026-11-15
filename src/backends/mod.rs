@@ -9,9 +9,11 @@ pub mod kube;
 pub mod libvirt;
 pub mod sysfs;
 pub mod systemd;
+pub mod virsh_events;
 
 pub use kernel::{Kernel, LinuxKernel};
 pub use kube::{Kube, KubeClient, Workload, WorkloadKind};
 pub use libvirt::{DomainEventSource, Libvirt, NoDomainEvents, RealLibvirt};
 pub use sysfs::{LinuxSysfs, Sysfs};
 pub use systemd::{Systemd, ZbusSystemd};
+pub use virsh_events::VirshEvents;

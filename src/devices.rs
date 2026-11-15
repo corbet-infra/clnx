@@ -240,6 +240,11 @@ impl<S: Sysfs, K: Kernel> HostDevices for LinuxDevices<S, K> {
                 .read(&format!("bus/pci/devices/{name}/vendor"))
                 .ok()
                 .map(|value| value.trim().to_owned());
+            let bar0_bytes = self
+                .sysfs
+                .file_len(&format!("bus/pci/devices/{name}/resource0"))
+                .ok()
+                .filter(|bytes| *bytes > 0);
             facts.push(DeviceFacts {
                 name,
                 address: Some(address),
@@ -247,6 +252,7 @@ impl<S: Sysfs, K: Kernel> HostDevices for LinuxDevices<S, K> {
                 class,
                 iommu_group: self.iommu_group(&address)?,
                 driver: self.driver(&address)?,
+                bar0_bytes,
             });
         }
         Ok(facts)

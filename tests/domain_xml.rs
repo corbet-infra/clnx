@@ -2,9 +2,9 @@
 
 use cdrv::{
     BlockDevice, CpuClaim, DeviceAddress, GuestOs, InstanceClass, InstanceId, InstanceKind,
-    InstanceSpec, MemoryClaim, SectorSize,
+    InstanceSpec, MemoryClaim, Nic, SectorSize,
 };
-use clnx::{Nic, RenderOptions, render_domain};
+use clnx::{RenderOptions, render_domain};
 
 fn disk(path: &str, serial: Option<&str>) -> BlockDevice {
     BlockDevice {
@@ -39,18 +39,20 @@ fn desktop_windows() -> InstanceSpec {
             disk("/dev/zvol/pool/vms/desktop-win", Some("SYNTHETIC-DISK-1")),
             disk("/dev/zvol/pool/vms/desktop-win-data", None),
         ],
+        vcpus: Some(8),
+        nic: Some(Nic {
+            mac: "52:54:00:00:00:01".to_owned(),
+            model: Some("virtio".to_owned()),
+        }),
+        console: false,
+        identity: None,
     }
 }
 
 fn options_windows() -> RenderOptions {
     RenderOptions {
-        vcpus: 8,
         mmio64_mib: 65_536,
         emulated_display: false,
-        nic: Some(Nic {
-            mac: "52:54:00:00:00:01".to_owned(),
-            model: "virtio".to_owned(),
-        }),
         ..RenderOptions::default()
     }
 }
@@ -69,12 +71,15 @@ fn dev_macos() -> InstanceSpec {
         class: InstanceClass::Dev,
         devices: Vec::new(),
         disks: vec![disk("/dev/zvol/pool/vms/dev-mac", Some("SYNTHETIC-DISK-2"))],
+        vcpus: Some(4),
+        nic: None,
+        console: false,
+        identity: None,
     }
 }
 
 fn options_macos() -> RenderOptions {
     RenderOptions {
-        vcpus: 4,
         opencore_iso: Some("/images/opencore.iso".into()),
         apple_smc_osk: Some("test-osk".to_owned()),
         cpu_model: Some("Skylake-Client-v4,vendor=GenuineIntel,+invtsc,kvm=on".to_owned()),
@@ -209,4 +214,32 @@ fn the_rendered_domains_match_their_snapshots() {
         render_domain(&dev_macos(), &options_macos()).unwrap(),
         include_str!("fixtures/dev-macos.xml")
     );
+}
+
+#[test]
+fn spec_console_identity_and_vcpus_reach_the_xml() {
+    let mut spec = desktop_windows();
+    spec.console = true;
+    spec.vcpus = Some(6);
+    spec.identity = Some(cdrv::Smbios {
+        manufacturer: "Synthetic Maker".to_owned(),
+        product: "Synthetic Product".to_owned(),
+        version: "1".to_owned(),
+        system_uuid: None,
+        board_manufacturer: None,
+        board_product: None,
+        board_version: None,
+    });
+    let xml = render_domain(&spec, &options_windows()).unwrap();
+    assert!(xml.contains("<vcpu placement='static'>6</vcpu>"));
+    assert!(xml.contains("<listen type='socket'/>"));
+    assert!(xml.contains("Synthetic Maker"));
+    assert!(xml.contains("<smbios mode='sysinfo'/>"));
+}
+
+#[test]
+fn zero_vcpus_are_refused() {
+    let mut spec = dev_macos();
+    spec.vcpus = Some(0);
+    assert!(render_domain(&spec, &options_macos()).is_err());
 }

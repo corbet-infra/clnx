@@ -130,9 +130,8 @@ pub enum DomainEventKind {
 
 /// Translate one observed domain event into the contract's envelope.
 ///
-/// The contract has no paused state: a suspend is reported as a warning event
-/// carrying `"state": "suspended"` and does not invent a state value. That gap
-/// is listed in the crate README.
+/// A suspend is reported as `instance.paused` with the contract's `paused`
+/// state.
 #[must_use]
 pub fn translate(event: &DomainEvent, log: &mut EventLog) -> Event {
     let (kind, state, severity, detail) = match event.kind {
@@ -145,12 +144,7 @@ pub fn translate(event: &DomainEvent, log: &mut EventLog) -> Event {
             Some(detail.as_str()),
         ),
         DomainEventKind::Resumed => ("instance.running", "running", Severity::Info, None),
-        DomainEventKind::Suspended => (
-            "instance.suspended",
-            "suspended",
-            Severity::Warn,
-            Some("suspended"),
-        ),
+        DomainEventKind::Suspended => ("instance.paused", "paused", Severity::Warn, Some("paused")),
         DomainEventKind::Shutdown => ("instance.stopping", "stopping", Severity::Info, None),
         DomainEventKind::Stopped(detail) if detail.is_failure() => (
             "instance.failed",
