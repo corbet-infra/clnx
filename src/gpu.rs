@@ -24,6 +24,19 @@ pub struct TenantConfig {
     pub sunshine_unit: Option<String>,
     /// Whether Sunshine is a user unit rather than a system unit.
     pub sunshine_in_user_manager: bool,
+    /// The GPU device plugin, when the platform runs one on this host.
+    pub device_plugin: Option<DevicePlugin>,
+}
+
+/// The GPU device plugin's pods on this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePlugin {
+    /// Their namespace.
+    pub namespace: String,
+    /// Their label selector.
+    pub labels: String,
+    /// This host's node name.
+    pub node: String,
 }
 
 impl Default for TenantConfig {
@@ -32,6 +45,7 @@ impl Default for TenantConfig {
             desktop_unit: "desktop-session.service".to_owned(),
             sunshine_unit: Some("sunshine.service".to_owned()),
             sunshine_in_user_manager: true,
+            device_plugin: None,
         }
     }
 }
@@ -146,6 +160,23 @@ impl<S: Systemd, K: Kube> HostGpu for LinuxGpu<S, K> {
 
     fn sunshine_follows(&self, kernel: &KernelOwner) -> CdrvResult<()> {
         self.sunshine(kernel.is_host())?;
+        Ok(())
+    }
+
+    fn restart_device_plugin(&self) -> CdrvResult<()> {
+        let Some(plugin) = &self.config.device_plugin else {
+            return Err(ClnxError::Refused("no GPU device plugin is configured".to_owned()).into());
+        };
+        let deleted = self
+            .kube
+            .delete_pods(&plugin.namespace, &plugin.labels, &plugin.node)?;
+        if deleted == 0 {
+            return Err(ClnxError::Refused(format!(
+                "no device plugin pod matches {} in {} on {}",
+                plugin.labels, plugin.namespace, plugin.node
+            ))
+            .into());
+        }
         Ok(())
     }
 }

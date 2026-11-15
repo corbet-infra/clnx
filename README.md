@@ -88,6 +88,31 @@ Listed for `cdrv`/the system owners, not applied here:
 10. **Storage.** `HostStorage` is not implemented in this iteration; disks are
    rendered from `InstanceSpec`, and creating/resetting them remains `cdsk`'s
    work.
+11. **BAR limits for a guest that cannot use full ReBAR.** macOS mishandles
+   large GPU BARs. OpenCore's manual (acidanthera/OpenCorePkg,
+   `Docs/Configuration.tex`, Booter > Quirks > `ResizeAppleGpuBars`): "While
+   Apple macOS supports a theoretical 1 GB maximum, in practice all
+   non-default values may not work correctly. For this reason the only
+   supported value for this quirk is the minimal supported BAR size". The
+   guest cannot shrink a BAR itself: vfio-pci gives it the Resizable BAR
+   capability read-only. `LinuxDevices::with_bar_limits` therefore shrinks the
+   GPU function's BARs on the host, between its unbind and the vfio-pci bind,
+   through `resource<N>_resize` (size code = log2 of the size in MiB, checked
+   against the BAR's own size mask before anything is written); the host
+   driver grows them back when it probes the card on the return. The limits
+   are per guest and deployment data (a Windows guest keeps the full BAR).
+12. **Device plugin restart** (cdrv `HostGpu::restart_device_plugin`): the
+   GPU device plugin's pods on this node are deleted through the Kubernetes
+   API (`TenantConfig::device_plugin`: namespace, labels, node) so their
+   controller starts fresh ones; a lost registration needs a new process.
+13. **Live ladder facts** (`pressure`): read at events, never on a timer.
+   Kubernetes watches (this node's GPU pods, the node, the broker Service's
+   endpoint slices) and the broker's own event stream (llama-swap
+   `/api/events`, `modelStatus` lines only) wake the observer; it then reads
+   the card's `mem_info_vram_used`/`_total`/`mem_info_gtt_used`, the GPU
+   workloads' ready replicas and rungs, the broker's `/running` and the node's
+   allocatable for the guarded resources. The broker is addressed through its
+   Service's cluster IP, read at each use.
 
 ## Proven on a real libvirt without the GPU
 

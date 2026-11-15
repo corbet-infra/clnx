@@ -67,6 +67,13 @@ impl Kube for FakeKube {
             .push(format!("skip:{namespace}:{skip}"));
         Ok(())
     }
+
+    fn delete_pods(&self, namespace: &str, labels: &str, node: &str) -> clnx::Result<u32> {
+        self.calls
+            .borrow_mut()
+            .push(format!("delete:{namespace}:{labels}:{node}"));
+        Ok(1)
+    }
 }
 
 fn workload(namespace: &str, name: &str, replicas: u32) -> Workload {
@@ -75,6 +82,9 @@ fn workload(namespace: &str, name: &str, replicas: u32) -> Workload {
         kind: WorkloadKind::Deployment,
         name: name.to_owned(),
         replicas,
+        ready: replicas,
+        ladder: None,
+        compute: true,
     }
 }
 
@@ -252,5 +262,30 @@ fn starting_with_zero_replicas_is_refused() {
         gpu.start_tenant("llm/inference", GpuLadder::BestEffort, 0)
             .is_err()
     );
+    assert!(kube.borrow().is_empty());
+}
+
+#[test]
+fn the_device_plugin_restart_deletes_its_pods_on_this_node() {
+    let config = TenantConfig {
+        device_plugin: Some(clnx::DevicePlugin {
+            namespace: "kube-system".to_owned(),
+            labels: "app=example-device-plugin".to_owned(),
+            node: "example-node".to_owned(),
+        }),
+        ..TenantConfig::default()
+    };
+    let (gpu, _systemd, kube) = driver(Vec::new(), config);
+    gpu.restart_device_plugin().unwrap();
+    assert_eq!(
+        kube.borrow().clone(),
+        vec!["delete:kube-system:app=example-device-plugin:example-node".to_owned()]
+    );
+}
+
+#[test]
+fn a_host_without_a_configured_device_plugin_refuses_the_restart() {
+    let (gpu, _systemd, kube) = driver(Vec::new(), TenantConfig::default());
+    assert!(gpu.restart_device_plugin().is_err());
     assert!(kube.borrow().is_empty());
 }

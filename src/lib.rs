@@ -32,6 +32,7 @@ pub mod events;
 pub mod gpu;
 pub mod instances;
 pub mod memory;
+pub mod pressure;
 
 mod proc;
 
@@ -44,6 +45,6 @@ pub use devices::{Bar0Size, BarLimit, LinuxDevices, bdf, parse_bdf};
 pub use domain_xml::{RenderOptions, is_fixed, render_domain};
 pub use error::{ClnxError, Result};
 pub use events::{DomainEvent, DomainEventKind, StartDetail, StopDetail, now_timestamp, translate};
-pub use gpu::{LinuxGpu, TenantConfig};
+pub use gpu::{DevicePlugin, LinuxGpu, TenantConfig};
 pub use instances::LinuxInstances;
 pub use memory::{LinuxMemory, SEVERE_PRESSURE_AVG10};
