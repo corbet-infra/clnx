@@ -1,6 +1,6 @@
 //! The systemd seam over D-Bus.
 //!
-//! The archlxc desktop session and the Sunshine unit are systemd units, not
+//! The desktop container session and the Sunshine unit are systemd units, not
 //! shell commands: the driver talks to the manager's D-Bus interface through
 //! `zbus`. The user-unit methods use a session-bus connection; a deployment
 //! that must reach another user's manager sets `DBUS_SESSION_BUS_ADDRESS`

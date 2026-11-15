@@ -68,7 +68,7 @@ Listed for `cdrv`/the system owners, not applied here:
 
 ## Proven on a real libvirt without the GPU
 
-`examples/srv_proof.rs` drives `LinuxInstances` and `LinuxMemory` against a
+`examples/host_proof.rs` drives `LinuxInstances` and `LinuxMemory` against a
 live libvirt with a synthetic domain on a throwaway 4Kn disk: define from the
 rendered XML, start, lifecycle events, balloon target and guest free pages,
 managed save and restore, ACPI clean stop (no `destroy` anywhere). Notes from
@@ -95,7 +95,7 @@ that run:
 - Kubernetes RBAC for the dynamic client, Argo CD's annotation actually
   holding a manual scale, and the cluster's real GPU resource names.
 - `StopMode::Hibernate` with a VFIO guest (managed save of a GPU-less guest is
-  proven on the srv; see `examples/srv_proof.rs`).
+  proven on a test host; see `examples/host_proof.rs`).
 
 ## How to run the tests
 

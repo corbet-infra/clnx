@@ -2,7 +2,7 @@
 //!
 //! The card belongs to exactly one kernel. While the host kernel holds it,
 //! the desktop session and the GPU pods share it by the ladder: the desktop
-//! session is stopped at its unit (archlxc itself keeps running), a pod is
+//! session is stopped at its unit (the container itself keeps running), a pod is
 //! scaled to zero behind Argo CD's skip-reconcile. The replicas a tenant had
 //! are remembered so returning it restores the platform's shape rather than a
 //! default. Sunshine runs on whichever kernel holds the card.

@@ -1,6 +1,6 @@
 //! Prove the instance and memory drivers against a live libvirt, without a GPU.
 //!
-//! Usage: `srv_proof <libvirt-uri> <4Kn-test-disk-path> <synthetic-domain-name>`
+//! Usage: `host_proof <libvirt-uri> <4Kn-test-disk-path> <synthetic-domain-name>`
 //!
 //! The domain is defined from the rendered XML, started, observed through
 //! lifecycle events, ballooned, saved (managed save), restored and stopped
@@ -35,7 +35,7 @@ fn wait_for(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let [_, uri, disk, name] = &args[..] else {
-        eprintln!("usage: srv_proof <uri> <disk> <name>");
+        eprintln!("usage: host_proof <uri> <disk> <name>");
         std::process::exit(2);
     };
     let spec = InstanceSpec {
