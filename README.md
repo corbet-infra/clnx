@@ -13,7 +13,7 @@ facts.
 | `domain_xml` | — | The single renderer: desktop class (VFIO functions, the 64 GiB MMIO window for ReBAR, fixed memory, no balloon), dev class (balloon, free-page reporting), 4Kn on every disk, macOS balloon on `pcie.0`. Pure and snapshot-tested. |
 | `devices` | `HostDevices` | Enumerates PCI functions and their **live** IOMMU groups from sysfs, refuses passthrough if a group holds an undeclared device, binds functions `.1 .2 .3` then `.0` (audio/USB/i2c before the GPU) only when no process holds the card's DRM nodes (or `/dev/kfd` for amdgpu) and the host driver's module use count is 0, returns in the proven reverse order (safe to repeat: a function already on its host driver is not bound or probed again), resets once and reports the result, and reports BAR0 size. |
 | `memory` | `HostMemory` | Reports `MemAvailable` plus the evictable ARC (`size - c_min` capped) and the PSI `full avg10` share; moves a balloon and reads balloon/RSS figures through libvirt. |
-| `gpu` | `HostGpu` | Stops the desktop session at its unit (the container keeps running), scales a GPU pod to zero behind Argo CD's skip-reconcile and restores its own replica count, and moves Sunshine to the kernel that holds the card. |
+| `gpu` | `HostGpu` | Stops the desktop session at its unit (the container keeps running; a start or stop returns only when systemd's job for it has finished with `done`, default deadline 120 s), scales a GPU pod to zero behind Argo CD's skip-reconcile and restores its own replica count, and moves Sunshine to the kernel that holds the card. |
 
 Every host boundary is a small trait in `backends`: `Libvirt`, `Sysfs`,
 `Kernel`, `Systemd`, `Kube`, `Procs`. Tests use fakes and fixture trees (a synthetic
@@ -70,7 +70,13 @@ Listed for `cdrv`/the system owners, not applied here:
    take the desktop session off the card (and wait for that job) before it
    asks for the bind. The `Sysfs` trait gained `list`, and `LinuxDevices`
    gained a `Procs` backend (`with_procs`, `with_holder_wait`).
-8. **Storage.** `HostStorage` is not implemented in this iteration; disks are
+8. **Unit jobs.** `StartUnit`/`StopUnit` return a job path; `ZbusSystemd`
+   subscribes to `JobRemoved` before the call and returns only when that job
+   is removed. A result other than `done`, or the deadline
+   (`with_job_timeout`), is an error naming the unit and the result. Stopping
+   the desktop session therefore returns after the whole graphical session is
+   down.
+9. **Storage.** `HostStorage` is not implemented in this iteration; disks are
    rendered from `InstanceSpec`, and creating/resetting them remains `cdsk`'s
    work.
 
