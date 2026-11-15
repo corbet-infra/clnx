@@ -183,6 +183,19 @@ fn sunshine_can_be_a_system_unit_instead() {
 }
 
 #[test]
+fn sunshine_inside_the_desktop_session_needs_no_unit_call() {
+    let config = TenantConfig {
+        sunshine_unit: None,
+        ..TenantConfig::default()
+    };
+    let (gpu, systemd, _kube) = driver(Vec::new(), config);
+    gpu.sunshine_follows(&KernelOwner::Host).unwrap();
+    gpu.sunshine_follows(&KernelOwner::Guest(InstanceId::from("desktop-win")))
+        .unwrap();
+    assert!(systemd.borrow().is_empty());
+}
+
+#[test]
 fn an_unknown_tenant_is_refused_without_touching_the_cluster() {
     let (gpu, _systemd, kube) = default_driver(vec![workload("llm", "inference", 1)]);
     let error = gpu

@@ -19,8 +19,9 @@ use crate::error::{ClnxError, Result};
 pub struct TenantConfig {
     /// The unit that owns the desktop session holding the card.
     pub desktop_unit: String,
-    /// The unit that runs Sunshine on the host.
-    pub sunshine_unit: String,
+    /// The unit that runs Sunshine on the host. `None` means Sunshine is part
+    /// of the desktop session unit and leaves and returns with it.
+    pub sunshine_unit: Option<String>,
     /// Whether Sunshine is a user unit rather than a system unit.
     pub sunshine_in_user_manager: bool,
 }
@@ -29,7 +30,7 @@ impl Default for TenantConfig {
     fn default() -> Self {
         Self {
             desktop_unit: "desktop-session.service".to_owned(),
-            sunshine_unit: "sunshine.service".to_owned(),
+            sunshine_unit: Some("sunshine.service".to_owned()),
             sunshine_in_user_manager: true,
         }
     }
@@ -84,7 +85,9 @@ impl<S: Systemd, K: Kube> LinuxGpu<S, K> {
     }
 
     fn sunshine(&self, start: bool) -> Result<()> {
-        let unit = self.config.sunshine_unit.as_str();
+        let Some(unit) = self.config.sunshine_unit.as_deref() else {
+            return Ok(());
+        };
         if start {
             if self.config.sunshine_in_user_manager {
                 self.systemd.start_user_unit(unit)
