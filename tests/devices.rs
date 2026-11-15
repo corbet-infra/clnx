@@ -39,6 +39,9 @@ struct RecordingSysfs {
     fail_bind: Option<String>,
     drm: HashMap<String, Vec<String>>,
     refcnt: String,
+    /// `resource<N>` lengths and `resource<N>_resize` masks by relative path.
+    bars: HashMap<String, u64>,
+    resize_masks: HashMap<String, String>,
 }
 
 impl RecordingSysfs {
@@ -67,7 +70,18 @@ impl RecordingSysfs {
             fail_bind: None,
             drm: HashMap::new(),
             refcnt: "0".to_owned(),
+            bars: HashMap::new(),
+            resize_masks: HashMap::new(),
         }
+    }
+
+    /// The GPU function's BAR `bar` is `bytes` large and resizable to `mask`.
+    fn with_bar(mut self, bar: u8, bytes: u64, mask: &str) -> Self {
+        let device = format!("bus/pci/devices/{}", bdf(&function(0)));
+        self.bars.insert(format!("{device}/resource{bar}"), bytes);
+        self.resize_masks
+            .insert(format!("{device}/resource{bar}_resize"), mask.to_owned());
+        self
     }
 
     fn with_extra(mut self, name: &str, group: u32, class: &'static str) -> Self {
@@ -117,6 +131,9 @@ impl Sysfs for RecordingSysfs {
         }
         if relative == "class/kfd/kfd/dev" {
             return Ok("235:0\n".to_owned());
+        }
+        if let Some(mask) = self.resize_masks.get(relative) {
+            return Ok(mask.clone());
         }
         if let Some(name) = relative
             .strip_suffix("/dev")
@@ -177,6 +194,9 @@ impl Sysfs for RecordingSysfs {
     }
 
     fn file_len(&self, relative: &str) -> clnx::Result<u64> {
+        if let Some(bytes) = self.bars.get(relative) {
+            return Ok(*bytes);
+        }
         Err(clnx::ClnxError::io(
             relative,
             std::io::ErrorKind::NotFound.into(),
@@ -816,4 +836,80 @@ fn sysfs_reads_drop_one_trailing_newline() {
     let sysfs = LinuxSysfs::new(root.path());
     assert_eq!(sysfs.read("value").unwrap(), "Y");
     let _: PathBuf = root.path().to_path_buf();
+}
+
+const GIB: u64 = 1 << 30;
+
+#[test]
+fn a_bar_limit_shrinks_the_gpu_bar_between_its_unbind_and_the_passthrough_bind() {
+    let sysfs = RecordingSysfs::card().with_bar(0, 16 * GIB, "0000000000007f00");
+    let writes = sysfs.writes();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default())
+        .with_bar_limits(vec![clnx::BarLimit { bar: 0, mib: 1024 }]);
+
+    driver.bind_passthrough(&function(0)).unwrap();
+
+    let gpu = bdf(&function(0));
+    let sequence: Vec<(String, String)> = writes
+        .borrow()
+        .iter()
+        .filter(|(path, value)| path.contains(&gpu) || value == &gpu)
+        .cloned()
+        .collect();
+    assert_eq!(
+        sequence,
+        vec![
+            (
+                format!("bus/pci/devices/{gpu}/driver_override"),
+                "vfio-pci".to_owned()
+            ),
+            (format!("bus/pci/devices/{gpu}/driver/unbind"), gpu.clone()),
+            // 1024 MiB = 2^10 MiB: the kernel's size code 10, written while no driver holds the function.
+            (
+                format!("bus/pci/devices/{gpu}/resource0_resize"),
+                "10".to_owned()
+            ),
+            ("bus/pci/drivers/vfio-pci/bind".to_owned(), gpu.clone()),
+        ]
+    );
+}
+
+#[test]
+fn a_bar_already_within_its_limit_is_left_alone() {
+    let sysfs = RecordingSysfs::card().with_bar(0, 256 << 20, "0000000000007f00");
+    let writes = sysfs.writes();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default())
+        .with_bar_limits(vec![clnx::BarLimit { bar: 0, mib: 1024 }]);
+
+    driver.bind_passthrough(&function(0)).unwrap();
+
+    assert!(
+        !writes
+            .borrow()
+            .iter()
+            .any(|(path, _)| path.ends_with("_resize"))
+    );
+}
+
+#[test]
+fn a_size_the_bar_does_not_support_is_refused_before_the_gpu_is_bound() {
+    // 128 MiB is below the card's smallest BAR0 size (the mask starts at 256 MiB).
+    let sysfs = RecordingSysfs::card().with_bar(0, 16 * GIB, "0000000000007f00");
+    let writes = sysfs.writes();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default())
+        .with_bar_limits(vec![clnx::BarLimit { bar: 0, mib: 128 }]);
+
+    let error = driver
+        .bind_passthrough(&function(0))
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("cannot be shrunk"), "{error}");
+    let gpu = bdf(&function(0));
+    assert!(!writes.borrow().iter().any(|(path, value)| {
+        path.ends_with("_resize") || (path == "bus/pci/drivers/vfio-pci/bind" && value == &gpu)
+    }));
 }

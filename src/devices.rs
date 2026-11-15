@@ -54,6 +54,20 @@ pub struct LinuxDevices<S: Sysfs, K: Kernel, P: Procs = LinuxProcs> {
     functions: Vec<DeviceAddress>,
     host_driver: String,
     holder_wait: Duration,
+    bar_limits: Vec<BarLimit>,
+}
+
+/// A size limit for one BAR of the card's GPU function, applied on the way to
+/// a guest while no driver holds the function (the kernel's
+/// `resource<N>_resize`). A guest that cannot use the full ReBAR window gets the
+/// card with that BAR shrunk; the host driver grows it back when it probes the
+/// card on the return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarLimit {
+    /// The BAR index (0 is the VRAM aperture of a GPU).
+    pub bar: u8,
+    /// The largest size the guest gets, in MiB; a power of two the BAR supports.
+    pub mib: u64,
 }
 
 /// What clears a `driver_override`: a newline. A zero-byte write never reaches
@@ -84,6 +98,7 @@ impl<S: Sysfs, K: Kernel> LinuxDevices<S, K> {
             functions,
             host_driver: host_driver.into(),
             holder_wait: DEFAULT_HOLDER_WAIT,
+            bar_limits: Vec::new(),
         }
     }
 }
@@ -99,6 +114,7 @@ impl<S: Sysfs, K: Kernel, P: Procs> LinuxDevices<S, K, P> {
             functions: self.functions,
             host_driver: self.host_driver,
             holder_wait: self.holder_wait,
+            bar_limits: self.bar_limits,
         }
     }
 
@@ -106,6 +122,14 @@ impl<S: Sysfs, K: Kernel, P: Procs> LinuxDevices<S, K, P> {
     #[must_use]
     pub fn with_holder_wait(mut self, wait: Duration) -> Self {
         self.holder_wait = wait;
+        self
+    }
+
+    /// Shrink these BARs of the GPU function before the passthrough bind
+    /// (empty: the guest gets the BARs as they are).
+    #[must_use]
+    pub fn with_bar_limits(mut self, limits: Vec<BarLimit>) -> Self {
+        self.bar_limits = limits;
         self
     }
 
@@ -280,7 +304,49 @@ impl<S: Sysfs, K: Kernel, P: Procs> LinuxDevices<S, K, P> {
             self.sysfs
                 .write(&format!("bus/pci/devices/{id}/driver/unbind"), id)?;
         }
+        if function.function == 0 {
+            for limit in &self.bar_limits {
+                self.shrink_bar(id, *limit)?;
+            }
+        }
         self.sysfs.write("bus/pci/drivers/vfio-pci/bind", id)
+    }
+
+    /// Shrink one BAR of a function no driver holds, when it is larger than the
+    /// limit. The size code is log2 of the size in MiB, and it must be one the
+    /// BAR's Resizable BAR capability lists (`resource<N>_resize` reads them as
+    /// a bitmask). A limit the BAR cannot take is refused before any write.
+    fn shrink_bar(&self, id: &str, limit: BarLimit) -> Result<()> {
+        let bar = limit.bar;
+        let current = self
+            .sysfs
+            .file_len(&format!("bus/pci/devices/{id}/resource{bar}"))?;
+        let wanted = limit.mib.saturating_mul(1 << 20);
+        if current <= wanted {
+            return Ok(());
+        }
+        let refused = |why: String| {
+            ClnxError::Refused(format!(
+                "BAR{bar} of {id} cannot be shrunk to {} MiB: {why}",
+                limit.mib
+            ))
+        };
+        if !limit.mib.is_power_of_two() {
+            return Err(refused("not a power of two".to_owned()));
+        }
+        let code = limit.mib.trailing_zeros();
+        let mask_text = self
+            .sysfs
+            .read(&format!("bus/pci/devices/{id}/resource{bar}_resize"))?;
+        let mask = u64::from_str_radix(mask_text.trim().trim_start_matches("0x"), 16)
+            .map_err(|_| refused(format!("unreadable size mask {:?}", mask_text.trim())))?;
+        if mask & (1 << code) == 0 {
+            return Err(refused(format!("the BAR supports the size mask {mask:#x}")));
+        }
+        self.sysfs.write(
+            &format!("bus/pci/devices/{id}/resource{bar}_resize"),
+            &code.to_string(),
+        )
     }
 
     /// The bind order: every non-zero function ascending, function 0 last.

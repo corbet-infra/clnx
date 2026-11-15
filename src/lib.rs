@@ -40,7 +40,7 @@ pub use backends::{
     LinuxKernel, LinuxProcs, LinuxSysfs, NoDomainEvents, ProcessRunner, Procs, RealLibvirt, Sysfs,
     Systemd, Workload, WorkloadKind, ZbusSystemd, makedev,
 };
-pub use devices::{Bar0Size, LinuxDevices, bdf, parse_bdf};
+pub use devices::{Bar0Size, BarLimit, LinuxDevices, bdf, parse_bdf};
 pub use domain_xml::{RenderOptions, is_fixed, render_domain};
 pub use error::{ClnxError, Result};
 pub use events::{DomainEvent, DomainEventKind, StartDetail, StopDetail, now_timestamp, translate};
