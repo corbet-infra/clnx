@@ -99,6 +99,30 @@ impl ZbusSystemd {
         Self::connect(true)
     }
 
+    /// Connect to the systemd manager on the bus at `address` (for example a
+    /// container's system bus, `unix:path=/proc/<pid>/root/run/dbus/system_bus_socket`),
+    /// with no session bus.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the address is invalid or the bus does not answer.
+    pub fn system_at(address: &str) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| ClnxError::backend("tokio", error.to_string()))?;
+        let builder = zbus::connection::Builder::address(address);
+        let system = runtime
+            .block_on(builder.build())
+            .map_err(|error| ClnxError::backend("systemd", format!("{address}: {error}")))?;
+        Ok(Self {
+            runtime,
+            system,
+            user: None,
+            job_timeout: DEFAULT_JOB_TIMEOUT,
+        })
+    }
+
     fn connect(user: bool) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
