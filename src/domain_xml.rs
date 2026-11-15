@@ -1,0 +1,752 @@
+//! Render a libvirt domain from an [`InstanceSpec`].
+//!
+//! The spec is the one source: this module replaces the Nix domain renderers,
+//! so the class rules (fixed memory and no balloon for a GPU desktop, balloon
+//! for a dev VM, 4Kn everywhere) are applied here rather than in a host's
+//! deployment code. Deployment data the spec does not carry (machine type,
+//! firmware paths, the guest's NIC, console socket) arrives in
+//! [`RenderOptions`]; the README lists those as contract gaps.
+//!
+//! The renderer is pure and deterministic: the same spec and options always
+//! render the same XML, so a fixture snapshot is a meaningful test.
+
+use cdrv::{
+    BlockDevice, DeviceAddress, GuestOs, InstanceClass, InstanceKind, InstanceSpec, MemoryClaim,
+};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use crate::error::{ClnxError, Result};
+
+/// The guest NIC the spec does not carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nic {
+    /// The MAC address the guest sees.
+    pub mac: String,
+    /// The virtio model libvirt asks QEMU for.
+    pub model: String,
+}
+
+/// Identifiers a Windows guest is frozen to.
+///
+/// These are a deployment fact (Windows activation depends on them), so they
+/// are supplied by the private instance definition and never defaulted here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Smbios {
+    /// The system manufacturer string.
+    pub manufacturer: String,
+    /// The system product string.
+    pub product: String,
+    /// The system version string.
+    pub version: String,
+    /// The optional system UUID.
+    pub system_uuid: Option<String>,
+    /// The optional board manufacturer.
+    pub board_manufacturer: Option<String>,
+    /// The optional board product.
+    pub board_product: Option<String>,
+    /// The optional board version.
+    pub board_version: Option<String>,
+}
+
+/// Deployment data the instance spec does not carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// The QEMU machine type.
+    pub machine: String,
+    /// The emulator binary path.
+    pub emulator: String,
+    /// The pflash code file, when the firmware needs an explicit loader.
+    pub loader: Option<PathBuf>,
+    /// The NVRAM template, when the firmware needs an explicit template.
+    pub nvram_template: Option<PathBuf>,
+    /// The per-domain NVRAM file.
+    pub nvram: Option<PathBuf>,
+    /// The OpenCore boot image of a macOS guest.
+    pub opencore_iso: Option<PathBuf>,
+    /// The AppleSMC OSK string for a macOS guest; never defaulted in this repo.
+    pub apple_smc_osk: Option<String>,
+    /// A custom CPU model string, rendered through the QEMU command line.
+    pub cpu_model: Option<String>,
+    /// The virtual CPU count (host policy, not an admission criterion).
+    pub vcpus: u32,
+    /// The 64-bit MMIO window in MiB, so OVMF can place a large BAR.
+    pub mmio64_mib: u64,
+    /// The guest NIC, when it has one.
+    pub nic: Option<Nic>,
+    /// A VNC socket for the local console.
+    pub console_socket: Option<PathBuf>,
+    /// Whether to keep an emulated display beside a passed-through card.
+    pub emulated_display: bool,
+    /// Extra MiB above the RAM claim for the domain's hard limit.
+    pub hard_limit_extra_mib: Option<u64>,
+    /// The SMBIOS identity of a Windows guest.
+    pub smbios: Option<Smbios>,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            machine: "pc-q35-11.1".to_owned(),
+            emulator: "qemu-system-x86_64".to_owned(),
+            loader: None,
+            nvram_template: None,
+            nvram: None,
+            opencore_iso: None,
+            apple_smc_osk: None,
+            cpu_model: None,
+            vcpus: 8,
+            mmio64_mib: 65_536,
+            nic: None,
+            console_socket: None,
+            emulated_display: true,
+            hard_limit_extra_mib: Some(4096),
+            smbios: None,
+        }
+    }
+}
+
+/// Render the libvirt domain XML for one instance.
+///
+/// # Errors
+///
+/// Refuses a spec that is inconsistent with the platform rules: a non-4Kn
+/// disk, a balloon on a claim a passed-through device has pinned, a claim
+/// whose fixed range is not fixed, or a passthrough set that cannot be placed
+/// on a guest PCI slot.
+pub fn render_domain(spec: &InstanceSpec, options: &RenderOptions) -> Result<String> {
+    validate(spec, options)?;
+    let macos = spec.guest_os == GuestOs::MacOs;
+    let windows = spec.guest_os == GuestOs::Windows;
+    let mut xml = Xml::default();
+
+    xml.line(
+        0,
+        "<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>",
+    );
+    xml.line(1, &format!("<name>{}</name>", escape(spec.id.as_str())));
+    xml.line(
+        1,
+        &format!("<memory unit='MiB'>{}</memory>", spec.memory.max_mib),
+    );
+    xml.line(
+        1,
+        &format!(
+            "<currentMemory unit='MiB'>{}</currentMemory>",
+            spec.memory.min_mib
+        ),
+    );
+    if let Some(extra) = options
+        .hard_limit_extra_mib
+        .filter(|_| !spec.memory.balloon)
+    {
+        xml.line(1, "<memtune>");
+        xml.line(
+            2,
+            &format!(
+                "<hard_limit unit='MiB'>{}</hard_limit>",
+                spec.memory.max_mib + extra
+            ),
+        );
+        xml.line(1, "</memtune>");
+    }
+    xml.line(
+        1,
+        &format!("<vcpu placement='static'>{}</vcpu>", options.vcpus),
+    );
+    render_sysinfo(&mut xml, options, macos);
+    render_os(&mut xml, options, macos);
+    render_features(&mut xml, windows);
+    render_cpu(&mut xml, options, macos);
+    render_clock(&mut xml, windows);
+    xml.line(1, "<on_poweroff>destroy</on_poweroff>");
+    xml.line(1, "<on_reboot>restart</on_reboot>");
+    xml.line(1, "<on_crash>destroy</on_crash>");
+    xml.line(1, "<devices>");
+    xml.line(
+        2,
+        &format!("<emulator>{}</emulator>", escape(&options.emulator)),
+    );
+    let slots = render_disks(&mut xml, spec, options, macos);
+    render_hostdevs(&mut xml, spec, &slots);
+    render_interfaces(&mut xml, options);
+    render_console(&mut xml, options);
+    render_inputs(&mut xml, macos, windows);
+    render_video(&mut xml, options, macos);
+    render_balloon(&mut xml, spec, macos);
+    render_tpm(&mut xml, windows);
+    if !macos {
+        xml.line(2, "<channel type='unix'>");
+        xml.line(3, "<target type='virtio' name='org.qemu.guest_agent.0'/>");
+        xml.line(2, "</channel>");
+    }
+    xml.line(1, "</devices>");
+    render_commandline(&mut xml, spec, options, macos);
+    xml.line(0, "</domain>");
+    Ok(xml.0)
+}
+
+/// Validate the spec against the platform rules before rendering anything.
+fn validate(spec: &InstanceSpec, options: &RenderOptions) -> Result<()> {
+    if spec.kind != InstanceKind::Vm {
+        return Err(ClnxError::Unsupported(
+            "clnx defines VMs as libvirt domains; containers and jails are other drivers"
+                .to_owned(),
+        ));
+    }
+    let id = spec.id.as_str();
+    if id.is_empty()
+        || id.contains(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '&' | '\'' | '"'))
+    {
+        return Err(ClnxError::InvalidSpec(
+            "the instance id must be non-empty and free of whitespace and XML punctuation"
+                .to_owned(),
+        ));
+    }
+    if options.vcpus == 0 {
+        return Err(ClnxError::InvalidSpec(
+            "vcpus must be at least 1".to_owned(),
+        ));
+    }
+    if spec.memory.min_mib == 0 || spec.memory.min_mib > spec.memory.max_mib {
+        return Err(ClnxError::InvalidSpec(format!(
+            "the memory claim {}-{} MiB is not a range",
+            spec.memory.min_mib, spec.memory.max_mib
+        )));
+    }
+    if !spec.memory.balloon && spec.memory.min_mib != spec.memory.max_mib {
+        return Err(ClnxError::InvalidSpec(
+            "a fixed claim needs min_mib == max_mib".to_owned(),
+        ));
+    }
+    if !spec.devices.is_empty() && spec.memory.balloon {
+        return Err(ClnxError::InvalidSpec(
+            "a passed-through device pins all guest memory, so the claim cannot balloon".to_owned(),
+        ));
+    }
+    for disk in &spec.disks {
+        if !disk.sector.is_four_kn() {
+            return Err(ClnxError::Refused(format!(
+                "4Kn always: {} presents a {} / {} byte sector",
+                disk.path.display(),
+                disk.sector.logical,
+                disk.sector.physical
+            )));
+        }
+    }
+    if spec.disks.len() > 25 {
+        return Err(ClnxError::InvalidSpec(
+            "at most 25 disks plus the OpenCore image fit the SATA name space".to_owned(),
+        ));
+    }
+    validate_slots(&spec.devices)
+}
+
+/// Group passed-through functions by host slot and check the guest placement.
+fn validate_slots(devices: &[DeviceAddress]) -> Result<()> {
+    let mut slots: BTreeMap<(u16, u8, u8), Vec<u8>> = BTreeMap::new();
+    for device in devices {
+        if device.function > 7 {
+            return Err(ClnxError::InvalidSpec(format!(
+                "PCI function {} is outside 0..=7",
+                device.function
+            )));
+        }
+        slots
+            .entry((device.domain, device.bus, device.slot))
+            .or_default()
+            .push(device.function);
+    }
+    for ((_, bus, slot), functions) in slots {
+        if !functions.contains(&0) {
+            return Err(ClnxError::InvalidSpec(format!(
+                "the passed-through slot {bus:02x}:{slot:02x} has no function 0"
+            )));
+        }
+        let mut seen = functions.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        if seen.len() != functions.len() {
+            return Err(ClnxError::InvalidSpec(format!(
+                "the passed-through slot {bus:02x}:{slot:02x} names a function twice"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn render_sysinfo(xml: &mut Xml, options: &RenderOptions, macos: bool) {
+    if macos {
+        xml.line(1, "<sysinfo type='smbios'>");
+        xml.line(2, "<system>");
+        xml.line(3, "<entry name='manufacturer'>Apple Inc.</entry>");
+        xml.line(3, "<entry name='product'>MacPro7,1</entry>");
+        xml.line(3, "<entry name='version'>1.0</entry>");
+        xml.line(2, "</system>");
+        xml.line(2, "<baseBoard>");
+        xml.line(3, "<entry name='manufacturer'>Apple Inc.</entry>");
+        xml.line(3, "<entry name='product'>Mac-27AD2F918AE68F61</entry>");
+        xml.line(3, "<entry name='version'>1.0</entry>");
+        xml.line(2, "</baseBoard>");
+        xml.line(1, "</sysinfo>");
+    } else if let Some(smbios) = &options.smbios {
+        xml.line(1, "<sysinfo type='smbios'>");
+        xml.line(2, "<system>");
+        xml.line(
+            3,
+            &format!(
+                "<entry name='manufacturer'>{}</entry>",
+                escape(&smbios.manufacturer)
+            ),
+        );
+        xml.line(
+            3,
+            &format!("<entry name='product'>{}</entry>", escape(&smbios.product)),
+        );
+        xml.line(
+            3,
+            &format!("<entry name='version'>{}</entry>", escape(&smbios.version)),
+        );
+        if let Some(uuid) = &smbios.system_uuid {
+            xml.line(3, &format!("<entry name='uuid'>{}</entry>", escape(uuid)));
+        }
+        xml.line(2, "</system>");
+        if let (Some(manufacturer), Some(product)) =
+            (&smbios.board_manufacturer, &smbios.board_product)
+        {
+            xml.line(2, "<baseBoard>");
+            xml.line(
+                3,
+                &format!(
+                    "<entry name='manufacturer'>{}</entry>",
+                    escape(manufacturer)
+                ),
+            );
+            xml.line(
+                3,
+                &format!("<entry name='product'>{}</entry>", escape(product)),
+            );
+            if let Some(version) = &smbios.board_version {
+                xml.line(
+                    3,
+                    &format!("<entry name='version'>{}</entry>", escape(version)),
+                );
+            }
+            xml.line(2, "</baseBoard>");
+        }
+        xml.line(1, "</sysinfo>");
+    }
+}
+
+fn render_os(xml: &mut Xml, options: &RenderOptions, macos: bool) {
+    let sysinfo = macos || options.smbios.is_some();
+    xml.line(1, "<os firmware='efi'>");
+    xml.line(
+        2,
+        &format!(
+            "<type arch='x86_64' machine='{}'>hvm</type>",
+            escape(&options.machine)
+        ),
+    );
+    xml.line(2, "<firmware>");
+    xml.line(3, "<feature enabled='no' name='secure-boot'/>");
+    xml.line(3, "<feature enabled='no' name='enrolled-keys'/>");
+    xml.line(2, "</firmware>");
+    if let Some(loader) = &options.loader {
+        xml.line(
+            2,
+            &format!(
+                "<loader readonly='yes' type='pflash' format='raw'>{}</loader>",
+                escape(&loader.display().to_string())
+            ),
+        );
+    }
+    if let Some(template) = &options.nvram_template
+        && let Some(nvram) = &options.nvram
+    {
+        xml.line(
+            2,
+            &format!(
+                "<nvram template='{}' templateFormat='raw' format='raw'>{}</nvram>",
+                escape(&template.display().to_string()),
+                escape(&nvram.display().to_string())
+            ),
+        );
+    }
+    if sysinfo {
+        xml.line(2, "<smbios mode='sysinfo'/>");
+    }
+    xml.line(1, "</os>");
+}
+
+fn render_features(xml: &mut Xml, windows: bool) {
+    xml.line(1, "<features>");
+    xml.line(2, "<acpi/>");
+    xml.line(2, "<apic/>");
+    if windows {
+        xml.line(2, "<hyperv mode='custom'>");
+        for name in [
+            "relaxed",
+            "vapic",
+            "vpindex",
+            "runtime",
+            "synic",
+            "stimer",
+            "reset",
+            "vendor_id",
+            "frequencies",
+            "reenlightenment",
+            "tlbflush",
+            "ipi",
+        ] {
+            xml.line(3, &format!("<{name} state='on'/>"));
+        }
+        xml.line(3, "<spinlocks state='on' retries='8191'/>");
+        xml.line(2, "</hyperv>");
+        xml.line(2, "<vmport state='off'/>");
+        xml.line(2, "<smm state='on'/>");
+        xml.line(2, "<ioapic driver='kvm'/>");
+    }
+    xml.line(1, "</features>");
+}
+
+fn render_cpu(xml: &mut Xml, options: &RenderOptions, macos: bool) {
+    if macos && options.cpu_model.is_some() {
+        // The model travels through the QEMU command line, as the proven
+        // macOS domain does; a `<cpu>` element beside it would duplicate -cpu.
+        return;
+    }
+    match &options.cpu_model {
+        Some(model) => {
+            xml.line(1, "<cpu mode='custom' match='exact' check='none'>");
+            xml.line(
+                2,
+                &format!("<model fallback='forbid'>{}</model>", escape(model)),
+            );
+            render_topology(xml, options.vcpus);
+            xml.line(1, "</cpu>");
+        }
+        None => {
+            xml.line(
+                1,
+                "<cpu mode='host-passthrough' check='none' migratable='off'>",
+            );
+            render_topology(xml, options.vcpus);
+            xml.line(1, "</cpu>");
+        }
+    }
+}
+
+fn render_topology(xml: &mut Xml, vcpus: u32) {
+    xml.line(
+        2,
+        &format!("<topology sockets='1' dies='1' clusters='1' cores='{vcpus}' threads='1'/>"),
+    );
+}
+
+fn render_clock(xml: &mut Xml, windows: bool) {
+    let offset = if windows { "localtime" } else { "utc" };
+    xml.line(1, &format!("<clock offset='{offset}'>"));
+    xml.line(2, "<timer name='rtc' tickpolicy='catchup'/>");
+    if windows {
+        xml.line(2, "<timer name='hypervclock' present='yes'/>");
+        xml.line(2, "<timer name='pit' tickpolicy='discard'/>");
+    } else {
+        xml.line(2, "<timer name='pit' tickpolicy='delay'/>");
+    }
+    xml.line(2, "<timer name='hpet' present='no'/>");
+    xml.line(1, "</clock>");
+}
+
+/// Render the disks and return the passed-through slots keyed by host slot.
+fn render_disks(
+    xml: &mut Xml,
+    spec: &InstanceSpec,
+    options: &RenderOptions,
+    macos: bool,
+) -> BTreeMap<(u16, u8, u8), u8> {
+    let sata = macos;
+    let mut order = 1;
+    let mut index = 0;
+    if macos && let Some(iso) = &options.opencore_iso {
+        xml.line(2, "<disk type='file' device='cdrom'>");
+        xml.line(3, "<driver name='qemu' type='raw'/>");
+        xml.line(
+            3,
+            &format!("<source file='{}'/>", escape(&iso.display().to_string())),
+        );
+        xml.line(3, "<target dev='sda' bus='sata'/>");
+        xml.line(3, "<readonly/>");
+        xml.line(3, &format!("<boot order='{order}'/>"));
+        xml.line(2, "</disk>");
+        order += 1;
+        index = 1;
+    }
+    for disk in &spec.disks {
+        render_disk(xml, disk, sata, order, index);
+        order += 1;
+        index += 1;
+    }
+    if sata && !spec.disks.is_empty() {
+        xml.line(2, "<controller type='sata' index='0'/>");
+    }
+    // One guest slot per distinct host slot, in address order; the functions
+    // of one card share a slot, as the proven passthrough domain places them.
+    let host_slots: std::collections::BTreeSet<(u16, u8, u8)> = spec
+        .devices
+        .iter()
+        .map(|device| (device.domain, device.bus, device.slot))
+        .collect();
+    host_slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, host)| (host, u8::try_from(index).unwrap_or(0)))
+        .collect()
+}
+
+fn render_disk(xml: &mut Xml, disk: &BlockDevice, sata: bool, order: usize, index: usize) {
+    let letters = if sata { "sd" } else { "vd" };
+    let letter = char::from(b'a' + u8::try_from(index).unwrap_or(0));
+    let dev = format!("{letters}{letter}");
+    xml.line(2, "<disk type='block' device='disk'>");
+    xml.line(
+        3,
+        "<driver name='qemu' type='raw' cache='none' discard='unmap'/>",
+    );
+    xml.line(
+        3,
+        &format!(
+            "<source dev='{}'/>",
+            escape(&disk.path.display().to_string())
+        ),
+    );
+    if sata {
+        xml.line(
+            3,
+            &format!("<target dev='{dev}' bus='sata' rotation_rate='1'/>"),
+        );
+    } else {
+        xml.line(3, &format!("<target dev='{dev}' bus='virtio'/>"));
+    }
+    xml.line(
+        3,
+        "<blockio logical_block_size='4096' physical_block_size='4096'/>",
+    );
+    if let Some(serial) = &disk.serial {
+        xml.line(3, &format!("<serial>{}</serial>", escape(serial)));
+    }
+    if disk.read_only {
+        xml.line(3, "<readonly/>");
+    }
+    xml.line(3, &format!("<boot order='{order}'/>"));
+    xml.line(2, "</disk>");
+}
+
+fn render_hostdevs(xml: &mut Xml, spec: &InstanceSpec, slots: &BTreeMap<(u16, u8, u8), u8>) {
+    if spec.devices.is_empty() {
+        return;
+    }
+    xml.line(2, "<controller type='pci' index='0' model='pcie-root'/>");
+    for slot in 0..slots.len() {
+        let index = slot + 1;
+        xml.line(
+            2,
+            &format!("<controller type='pci' index='{index}' model='pcie-root-port'>"),
+        );
+        xml.line(3, "<model name='pcie-root-port'/>");
+        xml.line(
+            3,
+            &format!("<target chassis='{index}' port='0x{:02x}'/>", 0x10 + slot),
+        );
+        xml.line(2, "</controller>");
+    }
+    let mut devices = spec.devices.clone();
+    devices.sort_unstable();
+    for device in &devices {
+        let slot = slots
+            .get(&(device.domain, device.bus, device.slot))
+            .copied()
+            .unwrap_or(0);
+        let multifunction = if device.function == 0 {
+            " multifunction='on'"
+        } else {
+            ""
+        };
+        xml.line(2, "<hostdev mode='subsystem' type='pci' managed='no'>");
+        xml.line(3, "<driver name='vfio'/>");
+        xml.line(3, "<source>");
+        xml.line(
+            4,
+            &format!(
+                "<address domain='0x{:04x}' bus='0x{:02x}' slot='0x{:02x}' function='0x{:x}'/>",
+                device.domain, device.bus, device.slot, device.function
+            ),
+        );
+        xml.line(3, "</source>");
+        xml.line(
+            3,
+            &format!(
+                "<address type='pci' domain='0x0000' bus='0x{:02x}' slot='0x00' function='0x{:x}'{multifunction}/>",
+                slot + 1,
+                device.function
+            ),
+        );
+        xml.line(2, "</hostdev>");
+    }
+}
+
+fn render_interfaces(xml: &mut Xml, options: &RenderOptions) {
+    if let Some(nic) = &options.nic {
+        xml.line(2, "<interface type='user'>");
+        xml.line(3, &format!("<mac address='{}'/>", escape(&nic.mac)));
+        xml.line(3, &format!("<model type='{}'/>", escape(&nic.model)));
+        xml.line(2, "</interface>");
+    }
+}
+
+fn render_console(xml: &mut Xml, options: &RenderOptions) {
+    if let Some(socket) = &options.console_socket {
+        xml.line(
+            2,
+            &format!(
+                "<graphics type='vnc' socket='{}'/>",
+                escape(&socket.display().to_string())
+            ),
+        );
+    }
+}
+
+fn render_inputs(xml: &mut Xml, macos: bool, windows: bool) {
+    if macos {
+        xml.line(2, "<input type='keyboard' bus='ps2'/>");
+        xml.line(2, "<input type='mouse' bus='ps2'/>");
+    } else if windows {
+        xml.line(2, "<input type='tablet' bus='usb'/>");
+        xml.line(2, "<input type='mouse' bus='ps2'/>");
+        xml.line(2, "<input type='keyboard' bus='ps2'/>");
+    }
+    xml.line(2, "<audio id='1' type='none'/>");
+}
+
+fn render_video(xml: &mut Xml, options: &RenderOptions, macos: bool) {
+    if !options.emulated_display {
+        xml.line(2, "<video>");
+        xml.line(3, "<model type='none'/>");
+        xml.line(2, "</video>");
+        return;
+    }
+    if macos {
+        xml.line(2, "<video>");
+        xml.line(
+            3,
+            "<model type='vmvga' vram='65536' heads='1' primary='yes'/>",
+        );
+        xml.line(2, "</video>");
+    } else {
+        xml.line(2, "<video>");
+        xml.line(
+            3,
+            "<model type='virtio' device='virtio-vga' heads='1' primary='yes'/>",
+        );
+        xml.line(2, "</video>");
+    }
+}
+
+fn render_balloon(xml: &mut Xml, spec: &InstanceSpec, macos: bool) {
+    if !spec.memory.balloon {
+        xml.line(2, "<memballoon model='none'/>");
+        return;
+    }
+    xml.line(
+        2,
+        "<memballoon model='virtio' autodeflate='on' freePageReporting='on'>",
+    );
+    xml.line(3, "<stats period='10'/>");
+    if macos {
+        // Measured: a macOS guest sees the virtio balloon only on pcie.0
+        // (bus 0x00); behind a root port it is invisible to the guest.
+        xml.line(
+            3,
+            "<address type='pci' domain='0x0000' bus='0x00' slot='0x13' function='0x0'/>",
+        );
+    }
+    xml.line(2, "</memballoon>");
+}
+
+fn render_tpm(xml: &mut Xml, windows: bool) {
+    if windows {
+        xml.line(2, "<tpm model='tpm-tis'>");
+        xml.line(
+            3,
+            "<backend type='emulator' version='2.0' persistent_state='yes'/>",
+        );
+        xml.line(2, "</tpm>");
+    }
+}
+
+fn render_commandline(xml: &mut Xml, spec: &InstanceSpec, options: &RenderOptions, macos: bool) {
+    let mut args: Vec<String> = Vec::new();
+    if macos {
+        if let Some(osk) = &options.apple_smc_osk {
+            args.push("-device".to_owned());
+            args.push(format!("isa-applesmc,osk={osk}"));
+        }
+        if let Some(model) = &options.cpu_model {
+            args.push("-cpu".to_owned());
+            args.push(model.clone());
+        }
+    }
+    let large_bar =
+        spec.class == InstanceClass::Desktop && !spec.devices.is_empty() && options.mmio64_mib > 0;
+    if large_bar {
+        args.push("-fw_cfg".to_owned());
+        args.push(format!(
+            "opt/ovmf/X-PciMmio64Mb,string={}",
+            options.mmio64_mib
+        ));
+    }
+    if args.is_empty() {
+        return;
+    }
+    xml.line(1, "<qemu:commandline>");
+    for arg in args {
+        xml.line(2, &format!("<qemu:arg value='{}'/>", escape(&arg)));
+    }
+    xml.line(1, "</qemu:commandline>");
+}
+
+/// Escape a value for an XML attribute or element text.
+fn escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\'' => out.push_str("&apos;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// A small indenting XML writer.
+#[derive(Debug, Default)]
+struct Xml(String);
+
+impl Xml {
+    fn line(&mut self, indent: usize, text: &str) {
+        for _ in 0..indent {
+            self.0.push_str("  ");
+        }
+        self.0.push_str(text);
+        self.0.push('\n');
+    }
+}
+
+/// Whether a claim is fixed, for callers that report class conformance.
+#[must_use]
+pub const fn is_fixed(claim: &MemoryClaim) -> bool {
+    !claim.balloon && claim.min_mib == claim.max_mib
+}

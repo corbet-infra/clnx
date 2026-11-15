@@ -1,0 +1,123 @@
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>desktop-win</name>
+  <memory unit='MiB'>24576</memory>
+  <currentMemory unit='MiB'>24576</currentMemory>
+  <memtune>
+    <hard_limit unit='MiB'>28672</hard_limit>
+  </memtune>
+  <vcpu placement='static'>8</vcpu>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='pc-q35-11.1'>hvm</type>
+    <firmware>
+      <feature enabled='no' name='secure-boot'/>
+      <feature enabled='no' name='enrolled-keys'/>
+    </firmware>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <vpindex state='on'/>
+      <runtime state='on'/>
+      <synic state='on'/>
+      <stimer state='on'/>
+      <reset state='on'/>
+      <vendor_id state='on'/>
+      <frequencies state='on'/>
+      <reenlightenment state='on'/>
+      <tlbflush state='on'/>
+      <ipi state='on'/>
+      <spinlocks state='on' retries='8191'/>
+    </hyperv>
+    <vmport state='off'/>
+    <smm state='on'/>
+    <ioapic driver='kvm'/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' clusters='1' cores='8' threads='1'/>
+  </cpu>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='hypervclock' present='yes'/>
+    <timer name='pit' tickpolicy='discard'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>qemu-system-x86_64</emulator>
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none' discard='unmap'/>
+      <source dev='/dev/zvol/pool/vms/desktop-win'/>
+      <target dev='vda' bus='virtio'/>
+      <blockio logical_block_size='4096' physical_block_size='4096'/>
+      <serial>SYNTHETIC-DISK-1</serial>
+      <boot order='1'/>
+    </disk>
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none' discard='unmap'/>
+      <source dev='/dev/zvol/pool/vms/desktop-win-data'/>
+      <target dev='vdb' bus='virtio'/>
+      <blockio logical_block_size='4096' physical_block_size='4096'/>
+      <boot order='2'/>
+    </disk>
+    <controller type='pci' index='0' model='pcie-root'/>
+    <controller type='pci' index='1' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='1' port='0x10'/>
+    </controller>
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x0000' bus='0x03' slot='0x00' function='0x0'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0' multifunction='on'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x0000' bus='0x03' slot='0x00' function='0x1'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x1'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x0000' bus='0x03' slot='0x00' function='0x2'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x2'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x0000' bus='0x03' slot='0x00' function='0x3'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x3'/>
+    </hostdev>
+    <interface type='user'>
+      <mac address='52:54:00:00:00:01'/>
+      <model type='virtio'/>
+    </interface>
+    <input type='tablet' bus='usb'/>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <audio id='1' type='none'/>
+    <video>
+      <model type='none'/>
+    </video>
+    <memballoon model='none'/>
+    <tpm model='tpm-tis'>
+      <backend type='emulator' version='2.0' persistent_state='yes'/>
+    </tpm>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+  </devices>
+  <qemu:commandline>
+    <qemu:arg value='-fw_cfg'/>
+    <qemu:arg value='opt/ovmf/X-PciMmio64Mb,string=65536'/>
+  </qemu:commandline>
+</domain>
