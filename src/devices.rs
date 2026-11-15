@@ -56,6 +56,12 @@ pub struct LinuxDevices<S: Sysfs, K: Kernel, P: Procs = LinuxProcs> {
     holder_wait: Duration,
 }
 
+/// What clears a `driver_override`: a newline. A zero-byte write never reaches
+/// the attribute's store handler, so an empty value would leave `vfio-pci` in
+/// place and the host driver's bind would answer ENODEV (seen live on
+/// 2026-11-15).
+pub const CLEAR_OVERRIDE: &str = "\n";
+
 /// How long the hand-over waits for holders of the card to leave.
 pub const DEFAULT_HOLDER_WAIT: Duration = Duration::from_secs(60);
 
@@ -399,8 +405,10 @@ impl<S: Sysfs, K: Kernel, P: Procs> HostDevices for LinuxDevices<S, K, P> {
                 self.sysfs
                     .write(&format!("bus/pci/devices/{id}/driver/unbind"), &id)?;
             }
-            self.sysfs
-                .write(&format!("bus/pci/devices/{id}/driver_override"), "")?;
+            self.sysfs.write(
+                &format!("bus/pci/devices/{id}/driver_override"),
+                CLEAR_OVERRIDE,
+            )?;
         }
         self.kernel.load_module(&self.host_driver, &[])?;
         // A repeated return must not fail: a bind of a function the host

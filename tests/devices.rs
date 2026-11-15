@@ -546,6 +546,15 @@ fn the_return_unbinds_the_gpu_function_first_and_probes_the_others_back() {
         probes,
         vec![bdf(&function(1)), bdf(&function(2)), bdf(&function(3))]
     );
+    // A newline clears an override; a zero-byte write never reaches sysfs's
+    // store handler and leaves vfio-pci in place (the live failure of 2026-11-15).
+    let overrides: Vec<String> = writes
+        .borrow()
+        .iter()
+        .filter(|(path, _)| path.ends_with("/driver_override"))
+        .map(|(_, value)| value.clone())
+        .collect();
+    assert_eq!(overrides, vec!["\n".to_owned(); 4]);
 }
 
 #[test]
@@ -562,7 +571,7 @@ fn a_card_already_back_on_the_host_driver_is_a_no_op_apart_from_the_overrides() 
     assert!(
         written
             .iter()
-            .all(|(path, value)| path.ends_with("/driver_override") && value.is_empty())
+            .all(|(path, value)| path.ends_with("/driver_override") && value == "\n")
     );
 }
 
