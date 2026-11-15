@@ -1781,7 +1781,3 @@ dependencies = [
  "socket2",
  "windows-sys 0.61.2",
 ]
-
-[[patch.unused]]
-name = "cdct"
-version = "0.1.0"

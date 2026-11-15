@@ -7,7 +7,7 @@ description = "Linux host drivers for the VM/GPU system: libvirt, VFIO, sysfs, s
 repository = "https://git.corbet.ch/corbet-infra/clnx"
 
 [dependencies]
-cdrv = { path = "../cdrv" }
+cdrv = { git = "https://git.corbet.ch/corbet-infra/cdrv.git", branch = "main" }
 # `kube` pulls `k8s-openapi`, which needs exactly one API-version feature and
 # cannot build without one. The driver runs beside one cluster, so the
 # minimum API server it targets is named here rather than left to a consumer.

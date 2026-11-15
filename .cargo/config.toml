@@ -1,4 +1,0 @@
-[patch."https://git.corbet.ch/corbet-infra/cdrv.git"]
-cdrv = { path = "/home/richc/agents/projects/forge/infra/cdrv" }
-[patch."https://git.corbet.ch/corbet-infra/cdct.git"]
-cdct = { path = "/home/richc/agents/projects/forge/infra/cdct" }
