@@ -4,6 +4,7 @@
 //! driver module is testable with a fake (`Libvirt`, `Systemd`, `Kube`, `Procs`) or a
 //! fixture tree (`Sysfs`, plus the `Kernel` seam for `modprobe`).
 
+pub mod command;
 pub mod kernel;
 pub mod kube;
 pub mod libvirt;
@@ -12,6 +13,7 @@ pub mod sysfs;
 pub mod systemd;
 pub mod virsh_events;
 
+pub use command::{CommandRunner, ProcessRunner};
 pub use kernel::{Kernel, LinuxKernel};
 pub use kube::{Kube, KubeClient, Workload, WorkloadKind};
 pub use libvirt::{DomainEventSource, Libvirt, NoDomainEvents, RealLibvirt};

@@ -9,7 +9,7 @@ facts.
 
 | Module | Implements | How |
 |---|---|---|
-| `instances` | `HostInstances` | Defines libvirt domains rendered from the one source (`InstanceSpec`), starts them, stops them cleanly (guest agent / ACPI, never `destroy`), and translates lifecycle events. |
+| `instances` | `HostInstances` | Defines libvirt domains rendered from the one source (`InstanceSpec`), starts them, stops them cleanly (guest agent / ACPI, or a per-instance command for a guest that ignores ACPI; never `destroy`), and translates lifecycle events. |
 | `domain_xml` | — | The single renderer: desktop class (VFIO functions, the 64 GiB MMIO window for ReBAR, fixed memory, no balloon), dev class (balloon, free-page reporting), 4Kn on every disk, macOS balloon on `pcie.0`. Pure and snapshot-tested. |
 | `devices` | `HostDevices` | Enumerates PCI functions and their **live** IOMMU groups from sysfs, refuses passthrough if a group holds an undeclared device, binds functions `.1 .2 .3` then `.0` (audio/USB/i2c before the GPU) only when no process holds the card's DRM nodes (or `/dev/kfd` for amdgpu) and the host driver's module use count is 0, returns in the proven reverse order (safe to repeat: a function already on its host driver is not bound or probed again), resets once and reports the result, and reports BAR0 size. |
 | `memory` | `HostMemory` | Reports `MemAvailable` plus the evictable ARC (`size - c_min` capped) and the PSI `full avg10` share; moves a balloon and reads balloon/RSS figures through libvirt. |
@@ -38,7 +38,7 @@ suite needs a hypervisor, a cluster or a GPU.
   material (the OSK is supplied by private configuration and defaults to
   absent) or a Windows identity (SMBIOS strings are supplied by the caller).
 
-The only external command this crate runs is `modprobe`; everything else goes
+The only external commands this crate runs are `modprobe` and the optional per-instance clean-stop command; everything else goes
 through libvirt, D-Bus, Kubernetes, or a sysfs write.
 
 ## Contract changes this driver needs
@@ -76,7 +76,16 @@ Listed for `cdrv`/the system owners, not applied here:
    (`with_job_timeout`), is an error naming the unit and the result. Stopping
    the desktop session therefore returns after the whole graphical session is
    down.
-9. **Storage.** `HostStorage` is not implemented in this iteration; disks are
+9. **Clean stop of a macOS guest.** A macOS guest ignores the ACPI power
+   button. `LinuxInstances::with_clean_stop(instance, argv)` names a command
+   (no shell) that makes the guest halt itself, for example an ssh
+   `sync; sudo -n /sbin/shutdown -h now`. `StopMode::Clean` for that instance
+   runs it instead of the libvirt request; its exit status is ignored (the
+   remote side cuts the session, ssh exits 255), a spawn failure is an error,
+   and the caller still waits for the lifecycle event. The command is private
+   deployment data and never part of this repository. Other instances keep
+   the guest-agent/ACPI request; `destroy` is never called.
+10. **Storage.** `HostStorage` is not implemented in this iteration; disks are
    rendered from `InstanceSpec`, and creating/resetting them remains `cdsk`'s
    work.
 

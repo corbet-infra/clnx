@@ -10,8 +10,8 @@ use cdrv::{
     InstanceSpec, InstanceState, MemoryClaim, Severity, Source, StopMode, Subject, Timestamp,
 };
 use clnx::{
-    ClnxError, DomainEvent, DomainEventKind, Libvirt, LinuxInstances, RenderOptions, StartDetail,
-    StopDetail, translate,
+    ClnxError, CommandRunner, DomainEvent, DomainEventKind, Libvirt, LinuxInstances, RenderOptions,
+    StartDetail, StopDetail, translate,
 };
 
 #[derive(Default)]
@@ -252,4 +252,107 @@ fn a_destroyed_stop_is_an_info_event() {
     let translated = translate(&event, &mut log);
     assert_eq!(translated.kind, "instance.stopped");
     assert_eq!(translated.severity, Severity::Info);
+}
+
+/// Records the commands it was asked to run.
+#[derive(Clone, Default)]
+struct FakeRunner {
+    runs: Rc<RefCell<Vec<Vec<String>>>>,
+    fail: bool,
+}
+
+impl CommandRunner for FakeRunner {
+    fn run(&self, argv: &[String]) -> clnx::Result<()> {
+        self.runs.borrow_mut().push(argv.to_vec());
+        if self.fail {
+            return Err(ClnxError::backend("clean stop", "cannot run"));
+        }
+        Ok(())
+    }
+}
+
+fn halt_command() -> Vec<String> {
+    ["ssh", "guest.example", "sudo -n /sbin/shutdown -h now"]
+        .map(String::from)
+        .to_vec()
+}
+
+#[test]
+fn a_configured_clean_stop_runs_the_command_and_not_libvirt() {
+    let log = log();
+    let runner = FakeRunner::default();
+    let instance = driver(FakeLibvirt::new(Rc::clone(&log), InstanceState::Running))
+        .with_command_runner(runner.clone())
+        .with_clean_stop("demo-vm", halt_command());
+
+    instance
+        .stop(&InstanceId::from("demo-vm"), StopMode::Clean)
+        .unwrap();
+
+    assert_eq!(*runner.runs.borrow(), vec![halt_command()]);
+    assert!(
+        log.borrow()
+            .calls
+            .iter()
+            .all(|call| !call.starts_with("shutdown"))
+    );
+    assert!(
+        log.borrow()
+            .calls
+            .iter()
+            .all(|call| !call.starts_with("destroy"))
+    );
+}
+
+#[test]
+fn an_instance_without_a_command_keeps_the_libvirt_request() {
+    let log = log();
+    let runner = FakeRunner::default();
+    let instance = driver(FakeLibvirt::new(Rc::clone(&log), InstanceState::Running))
+        .with_command_runner(runner.clone())
+        .with_clean_stop("other-vm", halt_command());
+
+    instance
+        .stop(&InstanceId::from("demo-vm"), StopMode::Clean)
+        .unwrap();
+
+    assert!(runner.runs.borrow().is_empty());
+    assert!(
+        log.borrow()
+            .calls
+            .contains(&"shutdown:demo-vm:Clean".to_owned())
+    );
+}
+
+#[test]
+fn a_command_that_cannot_be_spawned_is_an_error() {
+    let log = log();
+    let runner = FakeRunner {
+        fail: true,
+        ..FakeRunner::default()
+    };
+    let instance = driver(FakeLibvirt::new(Rc::clone(&log), InstanceState::Running))
+        .with_command_runner(runner)
+        .with_clean_stop("demo-vm", halt_command());
+
+    let result = instance.stop(&InstanceId::from("demo-vm"), StopMode::Clean);
+
+    assert!(result.is_err());
+    assert!(
+        log.borrow()
+            .calls
+            .iter()
+            .all(|call| !call.starts_with("shutdown"))
+    );
+}
+
+#[test]
+fn the_real_runner_ignores_the_exit_status_but_not_a_missing_program() {
+    use clnx::ProcessRunner;
+    let runner = ProcessRunner;
+    runner
+        .run(&["sh".to_owned(), "-c".to_owned(), "exit 255".to_owned()])
+        .unwrap();
+    assert!(runner.run(&["/nonexistent/program".to_owned()]).is_err());
+    assert!(runner.run(&[]).is_err());
 }
