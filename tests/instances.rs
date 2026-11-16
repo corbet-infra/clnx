@@ -116,6 +116,7 @@ fn spec() -> InstanceSpec {
         nic: None,
         console: false,
         identity: None,
+        on_reboot: None,
     }
 }
 

@@ -12,6 +12,7 @@
 
 use cdrv::{
     BlockDevice, DeviceAddress, GuestOs, InstanceClass, InstanceKind, InstanceSpec, MemoryClaim,
+    RebootAction,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -94,6 +95,10 @@ pub fn render_domain(spec: &InstanceSpec, options: &RenderOptions) -> Result<Str
         "<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>",
     );
     xml.line(1, &format!("<name>{}</name>", escape(spec.id.as_str())));
+    if let Some(uuid) = spec.identity.as_ref().and_then(|i| i.system_uuid.as_ref()) {
+        // the declared identity survives every redefine: libvirt would invent a new uuid otherwise
+        xml.line(1, &format!("<uuid>{}</uuid>", escape(uuid)));
+    }
     xml.line(
         1,
         &format!("<memory unit='MiB'>{}</memory>", spec.memory.max_mib),
@@ -129,7 +134,15 @@ pub fn render_domain(spec: &InstanceSpec, options: &RenderOptions) -> Result<Str
     render_cpu(&mut xml, spec, options, macos);
     render_clock(&mut xml, windows);
     xml.line(1, "<on_poweroff>destroy</on_poweroff>");
-    xml.line(1, "<on_reboot>restart</on_reboot>");
+    // macOS: a guest restart hangs at the AppleSMC halt (QEMU's applesmc cannot power the guest
+    // off or reset it cleanly), so the domain ends and whoever follows it starts it again.
+    let reboot = match spec.on_reboot {
+        Some(RebootAction::Restart) => "restart",
+        Some(RebootAction::Destroy) => "destroy",
+        None if macos => "destroy",
+        None => "restart",
+    };
+    xml.line(1, &format!("<on_reboot>{reboot}</on_reboot>"));
     xml.line(1, "<on_crash>destroy</on_crash>");
     xml.line(1, "<devices>");
     if let Some(emulator) = &options.emulator {
@@ -250,6 +263,9 @@ fn render_sysinfo(xml: &mut Xml, spec: &InstanceSpec, macos: bool) {
         xml.line(3, "<entry name='manufacturer'>Apple Inc.</entry>");
         xml.line(3, "<entry name='product'>MacPro7,1</entry>");
         xml.line(3, "<entry name='version'>1.0</entry>");
+        if let Some(uuid) = spec.identity.as_ref().and_then(|i| i.system_uuid.as_ref()) {
+            xml.line(3, &format!("<entry name='uuid'>{}</entry>", escape(uuid)));
+        }
         xml.line(2, "</system>");
         xml.line(2, "<baseBoard>");
         xml.line(3, "<entry name='manufacturer'>Apple Inc.</entry>");
@@ -577,8 +593,18 @@ fn render_hostdevs(xml: &mut Xml, spec: &InstanceSpec, slots: &BTreeMap<(u16, u8
 
 fn render_interfaces(xml: &mut Xml, spec: &InstanceSpec) {
     if let Some(nic) = &spec.nic {
-        xml.line(2, "<interface type='user'>");
-        xml.line(3, &format!("<mac address='{}'/>", escape(&nic.mac)));
+        match &nic.bridge {
+            Some(bridge) => {
+                // a tap on the declared host link; libvirt runs the setuid bridge helper itself
+                xml.line(2, "<interface type='bridge'>");
+                xml.line(3, &format!("<mac address='{}'/>", escape(&nic.mac)));
+                xml.line(3, &format!("<source bridge='{}'/>", escape(bridge)));
+            }
+            None => {
+                xml.line(2, "<interface type='user'>");
+                xml.line(3, &format!("<mac address='{}'/>", escape(&nic.mac)));
+            }
+        }
         xml.line(
             3,
             &format!(
@@ -586,6 +612,13 @@ fn render_interfaces(xml: &mut Xml, spec: &InstanceSpec) {
                 escape(nic.model.as_deref().unwrap_or("virtio"))
             ),
         );
+        if spec.guest_os == GuestOs::MacOs {
+            // the card keeps pcie.0 slot 0x12 (the path OpenCore's DeviceProperties name)
+            xml.line(
+                3,
+                "<address type='pci' domain='0x0000' bus='0x00' slot='0x12' function='0x0'/>",
+            );
+        }
         xml.line(2, "</interface>");
     }
 }

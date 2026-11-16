@@ -43,9 +43,11 @@ fn desktop_windows() -> InstanceSpec {
         nic: Some(Nic {
             mac: "52:54:00:00:00:01".to_owned(),
             model: Some("virtio".to_owned()),
+            bridge: None,
         }),
         console: false,
         identity: None,
+        on_reboot: None,
     }
 }
 
@@ -75,6 +77,7 @@ fn dev_macos() -> InstanceSpec {
         nic: None,
         console: false,
         identity: None,
+        on_reboot: None,
     }
 }
 
@@ -248,4 +251,60 @@ fn a_balloon_guest_boots_at_its_max_not_its_floor() {
     let xml = render_domain(&dev_macos(), &options_macos()).unwrap();
     assert!(xml.contains("<memory unit='MiB'>8192</memory>"));
     assert!(xml.contains("<currentMemory unit='MiB'>8192</currentMemory>"));
+}
+
+#[test]
+fn a_declared_macos_desktop_renders_its_identity_link_console_and_reboot_policy() {
+    let mut spec = dev_macos();
+    spec.nic = Some(Nic {
+        mac: "52:54:00:6d:61:63".to_owned(),
+        model: None,
+        bridge: Some("vms0".to_owned()),
+    });
+    spec.console = true;
+    spec.identity = Some(cdrv::Smbios {
+        manufacturer: "Apple Inc.".to_owned(),
+        product: "MacPro7,1".to_owned(),
+        version: "1.0".to_owned(),
+        system_uuid: Some("6d61636f-7468-7277-6100-0000000000d1".to_owned()),
+        board_manufacturer: None,
+        board_product: None,
+        board_version: None,
+    });
+    let options = RenderOptions {
+        console_socket: Some("/run/example-vnc.sock".into()),
+        ..options_macos()
+    };
+    let xml = render_domain(&spec, &options).unwrap();
+    assert!(xml.contains("<uuid>6d61636f-7468-7277-6100-0000000000d1</uuid>"));
+    assert!(xml.contains("<entry name='uuid'>6d61636f-7468-7277-6100-0000000000d1</entry>"));
+    assert!(xml.contains("<interface type='bridge'>"));
+    assert!(xml.contains("<source bridge='vms0'/>"));
+    assert!(xml.contains("<mac address='52:54:00:6d:61:63'/>"));
+    assert!(xml.contains("slot='0x12' function='0x0'/>"));
+    assert!(!xml.contains("<interface type='user'>"));
+    assert!(xml.contains("<graphics type='vnc' socket='/run/example-vnc.sock'"));
+    assert!(
+        !xml.contains("port="),
+        "the console is a unix socket only, never TCP"
+    );
+    assert!(
+        xml.contains("<on_reboot>destroy</on_reboot>"),
+        "macOS: a restart hangs at the AppleSMC halt"
+    );
+}
+
+#[test]
+fn the_reboot_policy_is_declarable_and_defaults_by_os() {
+    let mac = render_domain(&dev_macos(), &options_macos()).unwrap();
+    assert!(mac.contains("<on_reboot>destroy</on_reboot>"));
+    let win = render_domain(&desktop_windows(), &options_windows()).unwrap();
+    assert!(win.contains("<on_reboot>restart</on_reboot>"));
+    let mut spec = dev_macos();
+    spec.on_reboot = Some(cdrv::RebootAction::Restart);
+    assert!(
+        render_domain(&spec, &options_macos())
+            .unwrap()
+            .contains("<on_reboot>restart</on_reboot>")
+    );
 }

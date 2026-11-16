@@ -60,6 +60,7 @@ fn main() {
         nic: None,
         console: false,
         identity: None,
+        on_reboot: None,
     };
     let options = RenderOptions {
         loader: None,
