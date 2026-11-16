@@ -205,6 +205,13 @@ fn validate(spec: &InstanceSpec) -> Result<()> {
             "a passed-through device pins all guest memory, so the claim cannot balloon".to_owned(),
         ));
     }
+    if let Some(nic) = &spec.nic
+        && nic.bridge.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(ClnxError::InvalidSpec(
+            "a NIC needs the declared host link it is a tap on (nic.bridge)".to_owned(),
+        ));
+    }
     for disk in &spec.disks {
         if !disk.sector.is_four_kn() {
             return Err(ClnxError::Refused(format!(
@@ -590,35 +597,30 @@ fn render_hostdevs(xml: &mut Xml, spec: &InstanceSpec, slots: &BTreeMap<(u16, u8
 }
 
 fn render_interfaces(xml: &mut Xml, spec: &InstanceSpec) {
-    if let Some(nic) = &spec.nic {
-        match &nic.bridge {
-            Some(bridge) => {
-                // a tap on the declared host link; libvirt runs the setuid bridge helper itself
-                xml.line(2, "<interface type='bridge'>");
-                xml.line(3, &format!("<mac address='{}'/>", escape(&nic.mac)));
-                xml.line(3, &format!("<source bridge='{}'/>", escape(bridge)));
-            }
-            None => {
-                xml.line(2, "<interface type='user'>");
-                xml.line(3, &format!("<mac address='{}'/>", escape(&nic.mac)));
-            }
-        }
+    let Some(nic) = &spec.nic else {
+        return;
+    };
+    // always a tap on the declared host link (validate refuses a NIC without one); libvirt runs the
+    // setuid bridge helper itself. No user-mode networking, no host forwards.
+    let bridge = nic.bridge.as_deref().unwrap_or_default();
+    xml.line(2, "<interface type='bridge'>");
+    xml.line(3, &format!("<mac address='{}'/>", escape(&nic.mac)));
+    xml.line(3, &format!("<source bridge='{}'/>", escape(bridge)));
+    xml.line(
+        3,
+        &format!(
+            "<model type='{}'/>",
+            escape(nic.model.as_deref().unwrap_or("virtio"))
+        ),
+    );
+    if spec.guest_os == GuestOs::MacOs {
+        // the card keeps pcie.0 slot 0x12 (the path OpenCore's DeviceProperties name)
         xml.line(
             3,
-            &format!(
-                "<model type='{}'/>",
-                escape(nic.model.as_deref().unwrap_or("virtio"))
-            ),
+            "<address type='pci' domain='0x0000' bus='0x00' slot='0x12' function='0x0'/>",
         );
-        if spec.guest_os == GuestOs::MacOs {
-            // the card keeps pcie.0 slot 0x12 (the path OpenCore's DeviceProperties name)
-            xml.line(
-                3,
-                "<address type='pci' domain='0x0000' bus='0x00' slot='0x12' function='0x0'/>",
-            );
-        }
-        xml.line(2, "</interface>");
     }
+    xml.line(2, "</interface>");
 }
 
 fn render_console(xml: &mut Xml, spec: &InstanceSpec, options: &RenderOptions) {

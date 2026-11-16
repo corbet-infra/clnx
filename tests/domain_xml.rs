@@ -43,7 +43,7 @@ fn desktop_windows() -> InstanceSpec {
         nic: Some(Nic {
             mac: "52:54:00:00:00:01".to_owned(),
             model: Some("virtio".to_owned()),
-            bridge: None,
+            bridge: Some("vms0".to_owned()),
         }),
         console: false,
         identity: None,
@@ -307,4 +307,14 @@ fn the_reboot_policy_is_declarable_and_defaults_by_os() {
             .unwrap()
             .contains("<on_reboot>restart</on_reboot>")
     );
+}
+
+#[test]
+fn a_nic_without_a_declared_link_is_refused_and_user_networking_is_gone() {
+    let mut spec = desktop_windows();
+    spec.nic.as_mut().unwrap().bridge = None;
+    assert!(render_domain(&spec, &options_windows()).is_err());
+    let xml = render_domain(&desktop_windows(), &options_windows()).unwrap();
+    assert!(!xml.contains("type='user'"));
+    assert!(xml.contains("<source bridge='vms0'/>"));
 }
