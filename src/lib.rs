@@ -37,9 +37,10 @@ pub mod pressure;
 mod proc;
 
 pub use backends::{
-    CommandRunner, DeviceNode, DomainEventSource, Holder, Kernel, Kube, KubeClient, Libvirt,
-    LinuxKernel, LinuxProcs, LinuxSysfs, NoDomainEvents, ProcessRunner, Procs, RealLibvirt, Sysfs,
-    Systemd, Workload, WorkloadKind, ZbusSystemd, makedev,
+    CommandRunner, DeviceNode, DomainEventSource, GuestShutdown, Holder, Kernel, Kube, KubeClient,
+    Libvirt, LinuxKernel, LinuxProcs, LinuxSysfs, NoDomainEvents, ProcessRunner, Procs,
+    QemuShutdownEvents, RealLibvirt, Sysfs, Systemd, VirshEvents, Workload, WorkloadKind,
+    ZbusSystemd, makedev, parse_shutdown_line,
 };
 pub use devices::{Bar0Size, BarLimit, LinuxDevices, bdf, parse_bdf};
 pub use domain_xml::{RenderOptions, is_fixed, render_domain};
