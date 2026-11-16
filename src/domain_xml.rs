@@ -395,12 +395,10 @@ fn render_features(xml: &mut Xml, windows: bool) {
 }
 
 fn render_cpu(xml: &mut Xml, spec: &InstanceSpec, options: &RenderOptions, macos: bool) {
-    if macos && options.cpu_model.is_some() {
-        // The model travels through the QEMU command line, as the proven
-        // macOS domain does; a `<cpu>` element beside it would duplicate -cpu.
-        return;
-    }
-    match &options.cpu_model {
+    // macOS: the model travels through the QEMU command line (the proven macOS domain), and the
+    // `<cpu>` element stays host-passthrough with the topology: the command-line -cpu wins, the
+    // element only carries the (power-of-two) topology macOS needs.
+    match options.cpu_model.as_ref().filter(|_| !macos) {
         Some(model) => {
             xml.line(1, "<cpu mode='custom' match='exact' check='none'>");
             xml.line(
