@@ -548,7 +548,12 @@ fn render_hostdevs(xml: &mut Xml, spec: &InstanceSpec, slots: &BTreeMap<(u16, u8
         return;
     }
     xml.line(2, "<controller type='pci' index='0' model='pcie-root'/>");
-    for slot in 0..slots.len() {
+    // macOS: the card sits on pcie.0 itself (bus 0x00), one guest slot from 0x03 up per host slot. Measured
+    // 2026-11-16 (attempt 2): behind QEMU's pcie-root-ports macOS assigns no windows to the card or to
+    // anything else behind them (both ports closed and renumbered, even the xhci unmapped), so no
+    // root ports are rendered for it. Windows keeps one root port per slot.
+    let on_root = spec.guest_os == GuestOs::MacOs;
+    for slot in 0..slots.len().min(if on_root { 0 } else { usize::MAX }) {
         let index = slot + 1;
         xml.line(
             2,
@@ -584,14 +589,25 @@ fn render_hostdevs(xml: &mut Xml, spec: &InstanceSpec, slots: &BTreeMap<(u16, u8
             ),
         );
         xml.line(3, "</source>");
-        xml.line(
-            3,
-            &format!(
-                "<address type='pci' domain='0x0000' bus='0x{:02x}' slot='0x00' function='0x{:x}'{multifunction}/>",
-                slot + 1,
-                device.function
-            ),
-        );
+        if on_root {
+            xml.line(
+                3,
+                &format!(
+                    "<address type='pci' domain='0x0000' bus='0x00' slot='0x{:02x}' function='0x{:x}'{multifunction}/>",
+                    0x03 + slot,
+                    device.function
+                ),
+            );
+        } else {
+            xml.line(
+                3,
+                &format!(
+                    "<address type='pci' domain='0x0000' bus='0x{:02x}' slot='0x00' function='0x{:x}'{multifunction}/>",
+                    slot + 1,
+                    device.function
+                ),
+            );
+        }
         xml.line(2, "</hostdev>");
     }
 }

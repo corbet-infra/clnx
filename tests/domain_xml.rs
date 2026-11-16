@@ -318,3 +318,32 @@ fn a_nic_without_a_declared_link_is_refused_and_user_networking_is_gone() {
     assert!(!xml.contains("type='user'"));
     assert!(xml.contains("<source bridge='vms0'/>"));
 }
+
+#[test]
+fn a_macos_card_sits_on_pcie_zero_with_no_root_ports() {
+    let mut spec = dev_macos();
+    spec.class = InstanceClass::Desktop;
+    spec.memory = MemoryClaim::fixed(24 * 1024);
+    spec.devices = card(0x0a);
+    let xml = render_domain(&spec, &options_macos()).unwrap();
+    assert!(
+        !xml.contains("pcie-root-port"),
+        "no root ports for a macOS card: {xml}"
+    );
+    for function in 0..4 {
+        let multifunction = if function == 0 {
+            " multifunction='on'"
+        } else {
+            ""
+        };
+        assert!(
+            xml.contains(&format!(
+                "<address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x{function:x}'{multifunction}/>"
+            )),
+            "function {function} of the card on pcie.0 slot 0x03"
+        );
+    }
+    // Windows keeps its root port per slot
+    let win = render_domain(&desktop_windows(), &options_windows()).unwrap();
+    assert!(win.contains("pcie-root-port"));
+}
