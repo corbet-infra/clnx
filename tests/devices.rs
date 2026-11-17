@@ -39,9 +39,13 @@ struct RecordingSysfs {
     fail_bind: Option<String>,
     drm: HashMap<String, Vec<String>>,
     refcnt: String,
-    /// `resource<N>` lengths and `resource<N>_resize` masks by relative path.
+    /// Live BAR sizes (the kernel's `resource` table) and `resource<N>_resize`
+    /// masks by relative `resource<N>` path.
     bars: HashMap<String, u64>,
     resize_masks: HashMap<String, String>,
+    /// The `resource<N>` files' own lengths where they differ from the live size
+    /// (sysfs keeps a file's length from its creation).
+    stale_files: HashMap<String, u64>,
 }
 
 impl RecordingSysfs {
@@ -72,6 +76,7 @@ impl RecordingSysfs {
             refcnt: "0".to_owned(),
             bars: HashMap::new(),
             resize_masks: HashMap::new(),
+            stale_files: HashMap::new(),
         }
     }
 
@@ -81,6 +86,15 @@ impl RecordingSysfs {
         self.bars.insert(format!("{device}/resource{bar}"), bytes);
         self.resize_masks
             .insert(format!("{device}/resource{bar}_resize"), mask.to_owned());
+        self
+    }
+
+    /// The GPU function's `resource<bar>` file still has the length `bytes` from
+    /// an earlier size, while the BAR itself is as `with_bar` set it.
+    fn with_stale_file(mut self, bar: u8, bytes: u64) -> Self {
+        let device = format!("bus/pci/devices/{}", bdf(&function(0)));
+        self.stale_files
+            .insert(format!("{device}/resource{bar}"), bytes);
         self
     }
 
@@ -134,6 +148,21 @@ impl Sysfs for RecordingSysfs {
         }
         if let Some(mask) = self.resize_masks.get(relative) {
             return Ok(mask.clone());
+        }
+        if let Some(device) = relative.strip_suffix("/resource") {
+            // The kernel's table: one `start end flags` line per resource.
+            let mut table = String::new();
+            for bar in 0..6_u64 {
+                let bytes = self
+                    .bars
+                    .get(&format!("{device}/resource{bar}"))
+                    .copied()
+                    .unwrap_or(0);
+                let start = if bytes == 0 { 0 } else { (bar + 1) << 36 };
+                let end = if bytes == 0 { 0 } else { start + bytes - 1 };
+                table.push_str(&format!("{start:#018x} {end:#018x} 0x0000000000000000\n"));
+            }
+            return Ok(table);
         }
         if let Some(name) = relative
             .strip_suffix("/dev")
@@ -194,7 +223,11 @@ impl Sysfs for RecordingSysfs {
     }
 
     fn file_len(&self, relative: &str) -> clnx::Result<u64> {
-        if let Some(bytes) = self.bars.get(relative) {
+        if let Some(bytes) = self
+            .stale_files
+            .get(relative)
+            .or_else(|| self.bars.get(relative))
+        {
             return Ok(*bytes);
         }
         Err(clnx::ClnxError::io(
@@ -757,15 +790,25 @@ fn enumeration_reads_live_facts_from_a_sysfs_tree() {
 #[test]
 fn the_bar0_size_is_reported_as_a_fact() {
     let root = fixture();
-    let resource = root
+    let device = root
         .path()
-        .join(format!("bus/pci/devices/{}/resource0", bdf(&function(0))));
+        .join(format!("bus/pci/devices/{}", bdf(&function(0))));
+    // The kernel's resource table says 16 GiB; the resource0 file still has the
+    // 256 MiB length of an earlier shrink and must not be believed.
+    fs::write(
+        device.join("resource"),
+        "0x0000002400000000 0x00000027ffffffff 0x000000000014220c\n\
+         0x0000000000000000 0x0000000000000000 0x0000000000000000\n\
+         0x0000002800000000 0x00000028001fffff 0x000000000014220c\n",
+    )
+    .unwrap();
+    let resource = device.join("resource0");
     fs::write(&resource, []).unwrap();
     fs::OpenOptions::new()
         .write(true)
         .open(&resource)
         .unwrap()
-        .set_len(16 * (1 << 30))
+        .set_len(256 << 20)
         .unwrap();
     let driver = LinuxDevices::new(
         LinuxSysfs::new(root.path()),
@@ -890,6 +933,30 @@ fn a_bar_already_within_its_limit_is_left_alone() {
             .borrow()
             .iter()
             .any(|(path, _)| path.ends_with("_resize"))
+    );
+}
+
+#[test]
+fn a_bar_regrown_by_the_driver_is_shrunk_although_its_file_still_shows_the_old_size() {
+    // Attempt 3 (2026-11-17): amdgpu regrew BAR0 to 16 GiB on the return from the
+    // previous guest, but resource0 kept the 256 MiB length it had at that shrink.
+    let sysfs = RecordingSysfs::card()
+        .with_bar(0, 16 * GIB, "0000000000007f00")
+        .with_stale_file(0, 256 << 20);
+    let writes = sysfs.writes();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default())
+        .with_bar_limits(vec![clnx::BarLimit { bar: 0, mib: 256 }]);
+
+    driver.bind_passthrough(&function(0)).unwrap();
+
+    let gpu = bdf(&function(0));
+    assert!(
+        writes.borrow().iter().any(|(path, value)| {
+            path == &format!("bus/pci/devices/{gpu}/resource0_resize") && value == "8"
+        }),
+        "the live 16 GiB BAR0 is shrunk to 256 MiB (size code 8): {:?}",
+        writes.borrow()
     );
 }
 

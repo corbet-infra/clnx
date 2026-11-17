@@ -100,8 +100,13 @@ Listed for `cdrv`/the system owners, not applied here:
    GPU function's BARs on the host, between its unbind and the vfio-pci bind,
    through `resource<N>_resize` (size code = log2 of the size in MiB, checked
    against the BAR's own size mask before anything is written); the host
-   driver grows them back when it probes the card on the return. The limits
-   are per guest and deployment data (a Windows guest keeps the full BAR).
+   driver grows them back when it probes the card on the return. The current
+   size is the kernel's `resource` table (`end - start + 1`), never the length
+   of the `resource<N>` file: sysfs keeps a file's length from its creation, so
+   after amdgpu regrew BAR0 the file still showed the shrunk 256 MiB and the
+   shrink was skipped (2026-11-17, attempt 3: QEMU then failed to map a 16 GiB
+   BAR). The limits are per guest and deployment data (a Windows guest keeps
+   the full BAR).
 12. **Device plugin restart** (cdrv `HostGpu::restart_device_plugin`): the
    GPU device plugin's pods on this node are deleted through the Kubernetes
    API (`TenantConfig::device_plugin`: namespace, labels, node) so their

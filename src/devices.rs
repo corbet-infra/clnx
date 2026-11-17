@@ -147,9 +147,7 @@ impl<S: Sysfs, K: Kernel, P: Procs> LinuxDevices<S, K, P> {
     pub fn bar0_size(&self, device: &DeviceAddress) -> Result<Bar0Size> {
         self.ensure_declared(device)?;
         let id = bdf(device);
-        let bytes = self
-            .sysfs
-            .file_len(&format!("bus/pci/devices/{id}/resource0"))?;
+        let bytes = bar_len(&self.sysfs, &id, 0)?;
         Ok(Bar0Size { bytes })
     }
 
@@ -318,9 +316,7 @@ impl<S: Sysfs, K: Kernel, P: Procs> LinuxDevices<S, K, P> {
     /// a bitmask). A limit the BAR cannot take is refused before any write.
     fn shrink_bar(&self, id: &str, limit: BarLimit) -> Result<()> {
         let bar = limit.bar;
-        let current = self
-            .sysfs
-            .file_len(&format!("bus/pci/devices/{id}/resource{bar}"))?;
+        let current = bar_len(&self.sysfs, id, bar)?;
         let wanted = limit.mib.saturating_mul(1 << 20);
         if current <= wanted {
             return Ok(());
@@ -403,9 +399,7 @@ impl<S: Sysfs, K: Kernel, P: Procs> HostDevices for LinuxDevices<S, K, P> {
                 .read(&format!("bus/pci/devices/{name}/vendor"))
                 .ok()
                 .map(|value| value.trim().to_owned());
-            let bar0_bytes = self
-                .sysfs
-                .file_len(&format!("bus/pci/devices/{name}/resource0"))
+            let bar0_bytes = bar_len(&self.sysfs, &name, 0)
                 .ok()
                 .filter(|bytes| *bytes > 0);
             facts.push(DeviceFacts {
@@ -511,6 +505,37 @@ fn parse_dev(text: &str) -> Result<u64> {
     let major = major.parse::<u32>().map_err(|_| invalid())?;
     let minor = minor.parse::<u32>().map_err(|_| invalid())?;
     Ok(makedev(major, minor))
+}
+
+/// The live size of BAR `bar` of the PCI device `id`, in bytes (0 when unused).
+///
+/// Read from the kernel's `resource` table (`start end flags` per BAR), which
+/// follows a resize. The size of the `resource<N>` file does NOT: sysfs keeps
+/// the length the file had when it was created, so after a driver regrows a
+/// BAR (amdgpu does on every probe) it still shows the shrunk size.
+///
+/// # Errors
+///
+/// The table cannot be read or has no line for the BAR.
+pub fn bar_len<S: Sysfs>(sysfs: &S, id: &str, bar: u8) -> Result<u64> {
+    let path = format!("bus/pci/devices/{id}/resource");
+    let table = sysfs.read(&path)?;
+    let line = table
+        .lines()
+        .nth(usize::from(bar))
+        .ok_or_else(|| ClnxError::backend("sysfs", format!("{path} has no line for BAR{bar}")))?;
+    let mut fields = line.split_whitespace().map(|field| {
+        u64::from_str_radix(field.trim_start_matches("0x"), 16)
+            .map_err(|_| ClnxError::backend("sysfs", format!("{path}: unreadable line {line:?}")))
+    });
+    let (Some(start), Some(end)) = (fields.next(), fields.next()) else {
+        return Err(ClnxError::backend(
+            "sysfs",
+            format!("{path}: short line {line:?}"),
+        ));
+    };
+    let (start, end) = (start?, end?);
+    Ok(if end > start { end - start + 1 } else { 0 })
 }
 
 /// A PCI address as sysfs names it: `dddd:bb:ss.f`.
