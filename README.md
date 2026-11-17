@@ -26,7 +26,8 @@ suite needs a hypervisor, a cluster or a GPU.
 - destroy a guest except through the contract's explicit `destroy`; a stop is a
   clean guest-agent/ACPI request,
 - poll for state: lifecycle changes arrive as events, and a missing event
-  source is reported rather than replaced by a loop,
+  source is reported rather than replaced by a loop (one exception: the card
+  sampler, item 13, because the GTT counters have no event source at all),
 - kill a process that holds the card: the hand-over waits (pidfd, event-driven,
   default 60 s) for the holders to leave and then refuses, naming
   `pid comm node`; it never writes to sysfs while a holder or a busy host
@@ -105,14 +106,21 @@ Listed for `cdrv`/the system owners, not applied here:
    GPU device plugin's pods on this node are deleted through the Kubernetes
    API (`TenantConfig::device_plugin`: namespace, labels, node) so their
    controller starts fresh ones; a lost registration needs a new process.
-13. **Live ladder facts** (`pressure`): read at events, never on a timer.
+13. **Live ladder facts** (`pressure`): read at events.
    Kubernetes watches (this node's GPU pods, the node, the broker Service's
    endpoint slices) and the broker's own event stream (llama-swap
    `/api/events`, `modelStatus` lines only) wake the observer; it then reads
    the card's `mem_info_vram_used`/`_total`/`mem_info_gtt_used`, the GPU
    workloads' ready replicas and rungs, the broker's `/running` and the node's
    allocatable for the guarded resources. The broker is addressed through its
-   Service's cluster IP, read at each use.
+   Service's cluster IP, read at each use. The one clocked source is the
+   **card sampler** (`CardSampler`, 2026-11-17: the retired pressure-watcher's
+   6 s cadence restored): a desktop's graphics VRAM spills to system RAM (GTT)
+   without any event, so it reads the two local counters every interval and
+   wakes the observer only while the full card spills (GTT grew by more than
+   the noise floor since the previous reading, VRAM above the full fraction;
+   consecutive readings are counted as the grace), once when a spill ends, and
+   when VRAM crosses the full fraction. No API call is made unless it wakes.
 
 ## Proven on a real libvirt without the GPU
 

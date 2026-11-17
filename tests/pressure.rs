@@ -6,8 +6,11 @@ use std::fs;
 use cdrv::{DeviceAddress, GpuLadder};
 use clnx::LinuxSysfs;
 use clnx::backends::{Workload, WorkloadKind};
+use std::time::Duration;
+
 use clnx::pressure::{
-    CardMemory, card_memory, compute_tenants, is_model_status_line, stuck_models,
+    CardMemory, CardSample, CardSampler, SamplerConfig, card_memory, compute_tenants,
+    is_model_status_line, stuck_models,
 };
 
 fn card() -> DeviceAddress {
@@ -111,5 +114,110 @@ fn a_guarded_resource_is_zero_when_it_reads_zero_or_is_missing() {
             "example.com/video".to_owned(),
             "example.com/absent".to_owned()
         ]
+    );
+}
+
+const MIB: u64 = 1024 * 1024;
+const TOTAL: u64 = 16 * 1024 * MIB;
+
+fn sampler() -> CardSampler {
+    // The retired pressure-watcher's thresholds: 6 s, 64 MiB, 0.85.
+    CardSampler::new(SamplerConfig {
+        interval: Duration::from_secs(6),
+        gtt_delta_bytes: 64 * MIB,
+        vram_full_fraction: 0.85,
+    })
+}
+
+/// A reading with VRAM at `vram_percent` of 16 GiB and GTT at `gtt_mib`.
+fn reading(vram_percent: u64, gtt_mib: u64) -> Option<CardMemory> {
+    Some(CardMemory {
+        vram_used: TOTAL / 100 * vram_percent,
+        vram_total: TOTAL,
+        gtt_used: gtt_mib * MIB,
+    })
+}
+
+#[test]
+fn a_full_card_whose_gtt_grows_past_the_noise_floor_spills_and_is_counted() {
+    let mut sampler = sampler();
+    assert_eq!(
+        sampler.sample(reading(95, 100)),
+        None,
+        "the first reading has nothing to compare"
+    );
+    let first = sampler
+        .sample(reading(95, 300))
+        .expect("a spill is reported");
+    assert_eq!(first.spilling, 1);
+    assert_eq!(first.gtt_previous, 100 * MIB);
+    assert_eq!(first.memory.gtt_used, 300 * MIB);
+    let second = sampler
+        .sample(reading(96, 500))
+        .expect("a running spill is reported");
+    assert_eq!(
+        second.spilling, 2,
+        "consecutive spilling readings are the grace"
+    );
+    let ended = sampler
+        .sample(reading(96, 520))
+        .expect("the end of a spill is reported once");
+    assert_eq!(ended.spilling, 0);
+    assert_eq!(
+        sampler.sample(reading(96, 540)),
+        None,
+        "a quiet full card wakes nothing"
+    );
+}
+
+#[test]
+fn gtt_growth_is_no_spill_while_vram_has_room_or_below_the_noise_floor() {
+    let mut sampler = sampler();
+    sampler.sample(reading(50, 100));
+    assert_eq!(
+        sampler.sample(reading(50, 900)),
+        None,
+        "a card with room does not spill"
+    );
+    sampler.sample(reading(95, 900));
+    assert_eq!(
+        sampler.sample(reading(95, 950)),
+        None,
+        "50 MiB in one reading is below the 64 MiB noise floor"
+    );
+}
+
+#[test]
+fn crossing_the_full_fraction_is_reported_both_ways() {
+    let mut sampler = sampler();
+    sampler.sample(reading(50, 100));
+    let filled = sampler.sample(reading(90, 100)).expect("the card filled");
+    assert_eq!(filled.spilling, 0);
+    assert!(filled.memory.vram_full(0.85));
+    let emptied = sampler
+        .sample(reading(40, 100))
+        .expect("the card has room again");
+    assert!(!emptied.memory.vram_full(0.85));
+    assert_eq!(sampler.sample(reading(41, 100)), None);
+}
+
+#[test]
+fn unreadable_counters_end_a_running_spill() {
+    let mut sampler = sampler();
+    sampler.sample(reading(95, 100));
+    sampler.sample(reading(95, 300));
+    assert_eq!(
+        sampler.sample(None),
+        Some(CardSample {
+            memory: reading(95, 300).unwrap(),
+            gtt_previous: 300 * MIB,
+            spilling: 0,
+        })
+    );
+    assert_eq!(sampler.sample(None), None);
+    assert_eq!(
+        sampler.sample(reading(95, 900)),
+        None,
+        "after a gap the first reading compares nothing"
     );
 }

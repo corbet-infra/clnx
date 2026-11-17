@@ -7,11 +7,20 @@
 //! the model broker's own event stream (a model that starts or stops loading).
 //! [`observe`] then reads the facts once per wake-up: the card's VRAM and GTT
 //! counters in sysfs, the GPU workloads and their readiness, and the broker's
-//! stuck models. Nothing here polls on a timer.
+//! stuck models.
+//!
+//! One source runs on a clock: the [`CardSampler`]. Graphics VRAM spills to
+//! system RAM (GTT) without any Kubernetes or broker event, so only reading the
+//! counters notices a desktop that thrashes. It reads two local sysfs files
+//! every few seconds (the retired pressure-watcher's 6 s cadence, restored
+//! 2026-11-17) and wakes the observer only when the reading matters to the
+//! ladder: while the full card spills, when a spill ends, and when VRAM crosses
+//! the full fraction.
 
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread;
+use std::time::Duration;
 
 use cdrv::{DeviceAddress, GpuLadder};
 use futures::StreamExt;
@@ -28,7 +37,7 @@ use crate::devices::bdf;
 use crate::error::{ClnxError, Result};
 
 /// Where the facts and the event sources are, for one host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PressureConfig {
     /// This host's Kubernetes node name.
     pub node: String,
@@ -38,6 +47,20 @@ pub struct PressureConfig {
     pub broker: Option<BrokerConfig>,
     /// The device plugin and the resources it must advertise, when guarded.
     pub guard: Option<GuardConfig>,
+    /// The card sampler (the desktop's GTT spill), when it runs.
+    pub sampler: Option<SamplerConfig>,
+}
+
+/// The card sampler's clock and the two thresholds it applies; the thresholds
+/// are the conductor's (`vram_full_fraction`, `gtt_delta_bytes`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplerConfig {
+    /// Time between two readings (6 s).
+    pub interval: Duration,
+    /// GTT growth between two readings below which a spill is noise (64 MiB).
+    pub gtt_delta_bytes: u64,
+    /// The VRAM-used fraction above which the card counts as full (0.85).
+    pub vram_full_fraction: f64,
 }
 
 /// The registration guard: the resources the GPU device plugin must advertise
@@ -84,6 +107,8 @@ pub enum Wake {
     Kubernetes,
     /// The broker reported a model status change.
     Broker,
+    /// The card sampler took a reading that matters to the ladder.
+    Card(CardSample),
 }
 
 /// The card's memory counters.
@@ -95,6 +120,97 @@ pub struct CardMemory {
     pub vram_total: u64,
     /// GTT (system RAM the driver maps for the card) in use, in bytes.
     pub gtt_used: u64,
+}
+
+impl CardMemory {
+    /// Whether VRAM in use is above `fraction` of the total.
+    #[must_use]
+    pub fn vram_full(&self, fraction: f64) -> bool {
+        if self.vram_total == 0 {
+            return false;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let used = self.vram_used as f64 / self.vram_total as f64;
+        used > fraction
+    }
+}
+
+/// One reading of the card's counters, as the sampler reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardSample {
+    /// The counters now.
+    pub memory: CardMemory,
+    /// GTT in use at the previous reading, in bytes.
+    pub gtt_previous: u64,
+    /// Consecutive readings, this one included, in which the card was full and
+    /// GTT grew by more than the noise floor; 0 when it does not spill.
+    pub spilling: u32,
+}
+
+/// The desktop's GTT spill, read on a clock: the pressure-watcher's signal 2.
+///
+/// A reading spills when VRAM is above the full fraction and GTT grew by more
+/// than `gtt_delta_bytes` since the previous reading; consecutive spilling
+/// readings are counted (the conductor's grace). [`CardSampler::sample`]
+/// returns the reading to report only when it matters: every spilling reading,
+/// the first one after a spill, and each crossing of the full fraction.
+#[derive(Debug, Clone)]
+pub struct CardSampler {
+    config: SamplerConfig,
+    previous: Option<CardMemory>,
+    spilling: u32,
+    full: Option<bool>,
+}
+
+impl CardSampler {
+    /// A sampler that has read nothing yet.
+    #[must_use]
+    pub fn new(config: SamplerConfig) -> Self {
+        Self {
+            config,
+            previous: None,
+            spilling: 0,
+            full: None,
+        }
+    }
+
+    /// Take one reading; `None` means the counters could not be read.
+    pub fn sample(&mut self, memory: Option<CardMemory>) -> Option<CardSample> {
+        let Some(memory) = memory else {
+            // Unreadable counters are no spill: a running spill ends here.
+            let ended = self
+                .previous
+                .filter(|_| self.spilling > 0)
+                .map(|last| CardSample {
+                    memory: last,
+                    gtt_previous: last.gtt_used,
+                    spilling: 0,
+                });
+            self.previous = None;
+            self.spilling = 0;
+            self.full = None;
+            return ended;
+        };
+        let full = memory.vram_full(self.config.vram_full_fraction);
+        let gtt_previous = self.previous.map_or(memory.gtt_used, |last| last.gtt_used);
+        let spills = self.previous.is_some()
+            && full
+            && memory.gtt_used.saturating_sub(gtt_previous) > self.config.gtt_delta_bytes;
+        let was_spilling = self.spilling > 0;
+        self.spilling = if spills {
+            self.spilling.saturating_add(1)
+        } else {
+            0
+        };
+        let crossed = self.full.is_some_and(|was_full| was_full != full);
+        self.previous = Some(memory);
+        self.full = Some(full);
+        (spills || was_spilling || crossed).then_some(CardSample {
+            memory,
+            gtt_previous,
+            spilling: self.spilling,
+        })
+    }
 }
 
 /// One compute tenant on the card: a workload with a ladder rung.
@@ -272,7 +388,8 @@ fn fetch(url: &str) -> Option<String> {
 /// Service's endpoint slices) and the broker's event stream, read from
 /// `curl -N`. The stream is (re)connected when the broker's endpoints change,
 /// never on a timer: a broker scaled to zero costs nothing until its pods
-/// return. Everything stops when the receiver is gone.
+/// return. A second thread runs the [`CardSampler`] when it is configured.
+/// Everything stops when the receiver is gone.
 ///
 /// # Errors
 ///
@@ -287,11 +404,34 @@ pub fn watch(config: &PressureConfig, wake: &Sender<Wake>) -> Result<()> {
         .map_err(|error| ClnxError::backend("kubernetes", error.to_string()))?;
     let config = config.clone();
     let sender = wake.clone();
+    if let Some(sampler) = config.sampler {
+        let card = config.card;
+        let sender = wake.clone();
+        thread::Builder::new()
+            .name("clnx-card".to_owned())
+            .spawn(move || sample_card(&card, sampler, &sender))
+            .map_err(|error| ClnxError::backend("thread", error.to_string()))?;
+    }
     thread::Builder::new()
         .name("clnx-pressure".to_owned())
         .spawn(move || runtime.block_on(watch_sources(client, config, sender)))
         .map_err(|error| ClnxError::backend("thread", error.to_string()))?;
     Ok(())
+}
+
+/// The card sampler's loop: two local sysfs reads per interval, a wake-up only
+/// when the reading matters.
+fn sample_card(card: &DeviceAddress, config: SamplerConfig, wake: &Sender<Wake>) {
+    let sysfs = crate::backends::LinuxSysfs::system();
+    let mut sampler = CardSampler::new(config);
+    loop {
+        thread::sleep(config.interval);
+        if let Some(sample) = sampler.sample(card_memory(&sysfs, card))
+            && wake.send(Wake::Card(sample)).is_err()
+        {
+            return;
+        }
+    }
 }
 
 /// What one source reported.
