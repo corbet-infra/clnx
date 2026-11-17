@@ -144,10 +144,17 @@ fn dev_macos_puts_the_balloon_on_pcie_zero_and_has_no_rebar_window() {
     assert!(!xml.contains("<hostdev"));
     assert!(xml.contains("<disk type='file' device='cdrom'>"));
     // macOS disks are emulated NVMe at 4096/4096 behind the OpenCore CD (bootindex 1), never SATA
-    assert!(!xml.contains("<blockio"));
     assert!(!xml.contains("rotation_rate"));
-    assert!(xml.contains("nvme,drive=nvm0,serial=SYNTHETIC-DISK-2,logical_block_size=4096,physical_block_size=4096,discard_granularity=16384,bus=pcie.0,addr=0x14,bootindex=2"));
-    assert!(xml.contains("file=/dev/zvol/pool/vms/dev-mac,format=raw,cache=none,aio=native,discard=unmap,detect-zeroes=unmap"));
+    assert!(xml.contains("<target dev='nvme0n1' bus='nvme'/>"));
+    assert!(xml.contains("<serial>SYNTHETIC-DISK-2</serial>"));
+    assert!(xml.contains("<blockio logical_block_size='4096' physical_block_size='4096' discard_granularity='16384'/>"));
+    assert!(xml.contains("<driver name='qemu' type='raw' cache='none' io='native' discard='unmap' detect_zeroes='unmap'/>"));
+    assert!(xml.contains("<controller type='nvme' index='0'>"));
+    assert!(xml.contains("bus='0x00' slot='0x14' function='0x0'/>"));
+    assert!(
+        !xml.contains("-drive"),
+        "a native libvirt disk, not command-line arguments (EPERM on the system libvirt's device cgroup)"
+    );
     assert!(xml.contains("isa-applesmc,osk=test-osk"));
     assert!(xml.contains("<graphics") || xml.contains("<video>"));
 }

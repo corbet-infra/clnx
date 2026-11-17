@@ -462,6 +462,7 @@ fn render_disks(
     let sata = macos;
     let mut order = 1;
     let mut index = 0;
+    let mut nvme = 0;
     if macos && let Some(iso) = &options.opencore_iso {
         xml.line(2, "<disk type='file' device='cdrom'>");
         xml.line(3, "<driver name='qemu' type='raw'/>");
@@ -478,10 +479,13 @@ fn render_disks(
     }
     for disk in &spec.disks {
         if macos {
-            // macOS disks are emulated NVMe, 4096/4096 (render_commandline): QEMU
-            // refuses 4096-byte sectors on SATA/IDE. Boot order follows the CD.
+            // macOS disks are emulated NVMe, 4096/4096: QEMU refuses 4096-byte sectors on SATA/IDE.
+            // A native libvirt disk (not command-line arguments), so libvirt knows the device and
+            // allows it in the domain's device cgroup (a custom-argv disk got EPERM on the system
+            // libvirt, 2026-11-17).
+            render_nvme_disk(xml, disk, order, nvme);
             order += 1;
-            index += 1;
+            nvme += 1;
             continue;
         }
         render_disk(xml, disk, sata, order, index);
@@ -503,6 +507,49 @@ fn render_disks(
         .enumerate()
         .map(|(index, host)| (host, u8::try_from(index).unwrap_or(0)))
         .collect()
+}
+
+fn render_nvme_disk(xml: &mut Xml, disk: &BlockDevice, order: usize, index: usize) {
+    // `index` counts the NVMe disks (controller index = disk number, nothing else shares it)
+    xml.line(2, "<disk type='block' device='disk'>");
+    xml.line(
+        3,
+        "<driver name='qemu' type='raw' cache='none' io='native' discard='unmap' detect_zeroes='unmap'/>",
+    );
+    xml.line(
+        3,
+        &format!(
+            "<source dev='{}'/>",
+            escape(&disk.path.display().to_string())
+        ),
+    );
+    xml.line(3, "<target dev='nvme0n1' bus='nvme'/>");
+    let serial = disk
+        .serial
+        .clone()
+        .unwrap_or_else(|| format!("MACNVME{index}"));
+    xml.line(3, &format!("<serial>{}</serial>", escape(&serial)));
+    xml.line(
+        3,
+        "<blockio logical_block_size='4096' physical_block_size='4096' discard_granularity='16384'/>",
+    );
+    if disk.read_only {
+        xml.line(3, "<readonly/>");
+    }
+    xml.line(3, &format!("<boot order='{order}'/>"));
+    xml.line(2, "</disk>");
+    // the controller on pcie.0 itself (slot 0x14 + n; 0x12 is the NIC, 0x13 the balloon): libvirt
+    // would otherwise hang it behind a root port, where macOS assigns no windows (measured)
+    xml.line(2, &format!("<controller type='nvme' index='{index}'>"));
+    xml.line(3, &format!("<serial>{}</serial>", escape(&serial)));
+    xml.line(
+        3,
+        &format!(
+            "<address type='pci' domain='0x0000' bus='0x00' slot='0x{:02x}' function='0x0'/>",
+            0x14 + index
+        ),
+    );
+    xml.line(2, "</controller>");
 }
 
 fn render_disk(xml: &mut Xml, disk: &BlockDevice, sata: bool, order: usize, index: usize) {
@@ -738,26 +785,6 @@ fn render_commandline(xml: &mut Xml, spec: &InstanceSpec, options: &RenderOption
         if let Some(model) = &options.cpu_model {
             args.push("-cpu".to_owned());
             args.push(model.clone());
-        }
-    }
-    if macos {
-        // First guest bootindex after the OpenCore CD (1); pcie.0 slots 0x14.. (0x12 is the
-        // NIC, 0x13 the balloon, measured). discard + detect-zeroes let APFS TRIM free the zvol.
-        let first_boot = if options.opencore_iso.is_some() { 2 } else { 1 };
-        for (n, disk) in spec.disks.iter().enumerate() {
-            args.push("-drive".to_owned());
-            args.push(format!(
-                "if=none,id=nvm{n},file={},format=raw,cache=none,aio=native,discard=unmap,detect-zeroes=unmap{}",
-                disk.path.display(),
-                if disk.read_only { ",readonly=on" } else { "" }
-            ));
-            args.push("-device".to_owned());
-            args.push(format!(
-                "nvme,drive=nvm{n},serial={},logical_block_size=4096,physical_block_size=4096,discard_granularity=16384,bus=pcie.0,addr=0x{:x},bootindex={}",
-                disk.serial.clone().unwrap_or_else(|| format!("MACNVME{n}")),
-                0x14 + n,
-                first_boot + n
-            ));
         }
     }
     let large_bar =
