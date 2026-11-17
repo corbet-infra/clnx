@@ -41,8 +41,10 @@ struct RecordingSysfs {
     refcnt: String,
     /// Live BAR sizes (the kernel's `resource` table) and `resource<N>_resize`
     /// masks by relative `resource<N>` path.
-    bars: HashMap<String, u64>,
+    bars: RefCell<HashMap<String, u64>>,
     resize_masks: HashMap<String, String>,
+    /// A resize write leaves the live size as it was (a BAR that does not shrink).
+    resize_ignored: bool,
     /// The `resource<N>` files' own lengths where they differ from the live size
     /// (sysfs keeps a file's length from its creation).
     stale_files: HashMap<String, u64>,
@@ -74,8 +76,9 @@ impl RecordingSysfs {
             fail_bind: None,
             drm: HashMap::new(),
             refcnt: "0".to_owned(),
-            bars: HashMap::new(),
+            bars: RefCell::new(HashMap::new()),
             resize_masks: HashMap::new(),
+            resize_ignored: false,
             stale_files: HashMap::new(),
         }
     }
@@ -83,7 +86,9 @@ impl RecordingSysfs {
     /// The GPU function's BAR `bar` is `bytes` large and resizable to `mask`.
     fn with_bar(mut self, bar: u8, bytes: u64, mask: &str) -> Self {
         let device = format!("bus/pci/devices/{}", bdf(&function(0)));
-        self.bars.insert(format!("{device}/resource{bar}"), bytes);
+        self.bars
+            .get_mut()
+            .insert(format!("{device}/resource{bar}"), bytes);
         self.resize_masks
             .insert(format!("{device}/resource{bar}_resize"), mask.to_owned());
         self
@@ -91,6 +96,12 @@ impl RecordingSysfs {
 
     /// The GPU function's `resource<bar>` file still has the length `bytes` from
     /// an earlier size, while the BAR itself is as `with_bar` set it.
+    /// Resize writes do not change the live BAR size.
+    fn with_resize_ignored(mut self) -> Self {
+        self.resize_ignored = true;
+        self
+    }
+
     fn with_stale_file(mut self, bar: u8, bytes: u64) -> Self {
         let device = format!("bus/pci/devices/{}", bdf(&function(0)));
         self.stale_files
@@ -155,6 +166,7 @@ impl Sysfs for RecordingSysfs {
             for bar in 0..6_u64 {
                 let bytes = self
                     .bars
+                    .borrow()
                     .get(&format!("{device}/resource{bar}"))
                     .copied()
                     .unwrap_or(0);
@@ -199,6 +211,14 @@ impl Sysfs for RecordingSysfs {
             && let Some(name) = device_of(relative)
         {
             self.drivers.borrow_mut().remove(&name);
+        } else if let Some(bar_file) = relative.strip_suffix("_resize")
+            && !self.resize_ignored
+            && let Ok(code) = value.parse::<u32>()
+        {
+            // The kernel resizes the BAR: size = 2^code MiB.
+            self.bars
+                .borrow_mut()
+                .insert(bar_file.to_owned(), (1_u64 << code) << 20);
         }
         Ok(())
     }
@@ -223,11 +243,10 @@ impl Sysfs for RecordingSysfs {
     }
 
     fn file_len(&self, relative: &str) -> clnx::Result<u64> {
-        if let Some(bytes) = self
-            .stale_files
-            .get(relative)
-            .or_else(|| self.bars.get(relative))
-        {
+        if let Some(bytes) = self.stale_files.get(relative) {
+            return Ok(*bytes);
+        }
+        if let Some(bytes) = self.bars.borrow().get(relative) {
             return Ok(*bytes);
         }
         Err(clnx::ClnxError::io(
@@ -957,6 +976,68 @@ fn a_bar_regrown_by_the_driver_is_shrunk_although_its_file_still_shows_the_old_s
         }),
         "the live 16 GiB BAR0 is shrunk to 256 MiB (size code 8): {:?}",
         writes.borrow()
+    );
+}
+
+#[test]
+fn a_bar_still_above_its_limit_is_refused_and_the_whole_card_goes_back_to_the_host_driver() {
+    let sysfs = RecordingSysfs::card()
+        .with_bar(0, 16 * GIB, "0000000000007f00")
+        .with_resize_ignored();
+    let writes = sysfs.writes();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default())
+        .with_bar_limits(vec![clnx::BarLimit { bar: 0, mib: 256 }]);
+
+    let error = driver
+        .bind_passthrough(&function(0))
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("still 16384 MiB"), "{error}");
+    assert!(error.contains("back on amdgpu"), "{error}");
+    let gpu = bdf(&function(0));
+    let writes = writes.borrow();
+    assert!(
+        !writes
+            .iter()
+            .any(|(path, value)| path == "bus/pci/drivers/vfio-pci/bind" && value == &gpu),
+        "the GPU function never reaches vfio-pci: {writes:?}"
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(path, value)| path == "bus/pci/drivers/amdgpu/bind" && value == &gpu),
+        "the GPU function goes back to amdgpu: {writes:?}"
+    );
+    for number in 0..4 {
+        let id = bdf(&function(number));
+        assert!(
+            writes.iter().any(|(path, value)| {
+                path == &format!("bus/pci/devices/{id}/driver_override") && value == "\n"
+            }),
+            "{id}'s override is cleared: {writes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_bar_within_its_limit_is_checked_and_bound() {
+    // "Nothing to do" is read back too: a BAR at its limit passes the check and binds.
+    let sysfs = RecordingSysfs::card().with_bar(0, 256 << 20, "0000000000007f00");
+    let writes = sysfs.writes();
+    let driver = LinuxDevices::new(sysfs, RecordingKernel::new("Y"), card(), "amdgpu")
+        .with_procs(FakeProcs::default())
+        .with_bar_limits(vec![clnx::BarLimit { bar: 0, mib: 256 }]);
+
+    driver.bind_passthrough(&function(0)).unwrap();
+
+    let gpu = bdf(&function(0));
+    assert!(
+        writes
+            .borrow()
+            .iter()
+            .any(|(path, value)| path == "bus/pci/drivers/vfio-pci/bind" && value == &gpu)
     );
 }
 

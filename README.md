@@ -105,8 +105,11 @@ Listed for `cdrv`/the system owners, not applied here:
    of the `resource<N>` file: sysfs keeps a file's length from its creation, so
    after amdgpu regrew BAR0 the file still showed the shrunk 256 MiB and the
    shrink was skipped (2026-11-17, attempt 3: QEMU then failed to map a 16 GiB
-   BAR). The limits are per guest and deployment data (a Windows guest keeps
-   the full BAR).
+   BAR). It fails closed: after the shrink, and also when there was nothing to
+   shrink, the live size is read back, and a BAR still above its limit refuses
+   the passthrough before the GPU function reaches vfio-pci; the whole card is
+   handed back to the host driver (the desktop keeps its card). The limits are
+   per guest and deployment data (a Windows guest keeps the full BAR).
 12. **Device plugin restart** (cdrv `HostGpu::restart_device_plugin`): the
    GPU device plugin's pods on this node are deleted through the Kubernetes
    API (`TenantConfig::device_plugin`: namespace, labels, node) so their

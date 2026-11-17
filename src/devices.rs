@@ -292,22 +292,46 @@ impl<S: Sysfs, K: Kernel, P: Procs> LinuxDevices<S, K, P> {
         Ok(intruders)
     }
 
-    fn bind_one(&self, function: &DeviceAddress, id: &str) -> Result<()> {
+    fn bind_one(&self, function: &DeviceAddress, id: &str) -> std::result::Result<(), BindFailure> {
+        let other = BindFailure::Other;
         self.sysfs
-            .write(&format!("bus/pci/devices/{id}/driver_override"), "vfio-pci")?;
-        if self.driver(function)?.as_deref() == Some("vfio-pci") {
+            .write(&format!("bus/pci/devices/{id}/driver_override"), "vfio-pci")
+            .map_err(other)?;
+        if self.driver(function).map_err(other)?.as_deref() == Some("vfio-pci") {
             return Ok(());
         }
-        if self.driver(function)?.is_some() {
+        if self.driver(function).map_err(other)?.is_some() {
             self.sysfs
-                .write(&format!("bus/pci/devices/{id}/driver/unbind"), id)?;
+                .write(&format!("bus/pci/devices/{id}/driver/unbind"), id)
+                .map_err(other)?;
         }
         if function.function == 0 {
             for limit in &self.bar_limits {
-                self.shrink_bar(id, *limit)?;
+                self.shrink_bar(id, *limit)
+                    .and_then(|()| self.verify_bar(id, *limit))
+                    .map_err(BindFailure::Bar)?;
             }
         }
-        self.sysfs.write("bus/pci/drivers/vfio-pci/bind", id)
+        self.sysfs
+            .write("bus/pci/drivers/vfio-pci/bind", id)
+            .map_err(other)
+    }
+
+    /// Fail closed: after the shrink, and also when there was nothing to
+    /// shrink, the BAR's live size must be within its limit. A guest never gets
+    /// a BAR it cannot use (attempt 3, 2026-11-17: a skipped shrink handed
+    /// macOS a 16 GiB BAR0 and QEMU crashed).
+    fn verify_bar(&self, id: &str, limit: BarLimit) -> Result<()> {
+        let live = bar_len(&self.sysfs, id, limit.bar)?;
+        if live > limit.mib.saturating_mul(1 << 20) {
+            return Err(ClnxError::Refused(format!(
+                "BAR{} of {id} is still {} MiB after the shrink to {} MiB",
+                limit.bar,
+                live >> 20,
+                limit.mib
+            )));
+        }
+        Ok(())
     }
 
     /// Shrink one BAR of a function no driver holds, when it is larger than the
@@ -441,17 +465,37 @@ impl<S: Sysfs, K: Kernel, P: Procs> HostDevices for LinuxDevices<S, K, P> {
         let mut done: Vec<String> = Vec::new();
         for function in self.bind_order() {
             let id = bdf(&function);
-            // A failure stops the bind (never retried) and names the functions
-            // already on vfio-pci, so the caller sees the half-bound card.
-            self.bind_one(&function, &id)
-                .map_err(|error| ClnxError::Backend {
-                    backend: "vfio bind",
-                    message: format!(
-                        "binding {id} failed ({error}); already on vfio-pci: [{}]",
-                        done.join(", ")
-                    ),
-                })?;
-            done.push(id);
+            match self.bind_one(&function, &id) {
+                Ok(()) => done.push(id),
+                // A BAR limit that cannot be met refuses the passthrough before the
+                // GPU function reaches vfio-pci, and the whole card goes back to the
+                // host driver: the desktop keeps its card.
+                Err(BindFailure::Bar(error)) => {
+                    let message = match self.unbind_passthrough(device) {
+                        Ok(()) => format!(
+                            "{error}; nothing is passed through, the card is back on {}",
+                            self.host_driver
+                        ),
+                        Err(again) => format!(
+                            "{error}; handing the card back to {} failed too: {again}",
+                            self.host_driver
+                        ),
+                    };
+                    return Err(ClnxError::Refused(message).into());
+                }
+                // Any other failure stops the bind (never retried) and names the
+                // functions already on vfio-pci, so the caller sees the half-bound card.
+                Err(BindFailure::Other(error)) => {
+                    return Err(ClnxError::Backend {
+                        backend: "vfio bind",
+                        message: format!(
+                            "binding {id} failed ({error}); already on vfio-pci: [{}]",
+                            done.join(", ")
+                        ),
+                    }
+                    .into());
+                }
+            }
         }
         Ok(())
     }
@@ -505,6 +549,14 @@ fn parse_dev(text: &str) -> Result<u64> {
     let major = major.parse::<u32>().map_err(|_| invalid())?;
     let minor = minor.parse::<u32>().map_err(|_| invalid())?;
     Ok(makedev(major, minor))
+}
+
+/// Why binding one function to vfio-pci failed.
+enum BindFailure {
+    /// A BAR limit could not be met; the function is not on vfio-pci.
+    Bar(ClnxError),
+    /// Anything else.
+    Other(ClnxError),
 }
 
 /// The live size of BAR `bar` of the PCI device `id`, in bytes (0 when unused).
